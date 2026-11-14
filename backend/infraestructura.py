@@ -374,10 +374,7 @@ class RepositorioIrsa:
                 distribucion_flags.append({
                     "valor": int(valor),
                     "cantidad": cantidad,
-                    "porcentaje": round(
-                        cantidad / flags_validos * 100,
-                        4
-                    )
+                    "porcentaje": round(cantidad / flags_validos * 100, 6)
                 })
 
             return {
