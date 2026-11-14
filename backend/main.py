@@ -1,6 +1,8 @@
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
+
 from aplicacion import BuscarObservaciones
+from infraestructura import RepositorioIrsa
 
 app = FastAPI(
     title="SPHEREx Explorer",
@@ -8,11 +10,18 @@ app = FastAPI(
     version="1.0.0"
 )
 
-buscar_observaciones = BuscarObservaciones()
+# Inyección de dependencias
+repositorio = RepositorioIrsa()
+buscar_observaciones = BuscarObservaciones(repositorio)
 
 
 @app.get("/api/v1/estado")
 async def obtener_estado():
+    """
+    Comprueba el estado de funcionamiento de la API.
+    Devuelve un mensaje con el estado del servicio.
+    """
+
     return {
         "estado": "funcionando",
         "proyecto": "SPHEREx Explorer"
@@ -20,5 +29,30 @@ async def obtener_estado():
 
 
 @app.get("/api/v1/observaciones")
-async def obtener_observaciones():
-    return buscar_observaciones.ejecutar()
+async def obtener_observaciones(
+    ascension_recta: float = Query(..., ge=0, le=360),
+    declinacion: float = Query(..., ge=-90, le=90),
+    radio: float = Query(1, gt=0, le=3600)
+):
+    """
+    Busca productos SPHEREx alrededor de unas coordenadas.
+    Devuelve los productos encontrados o un error si falla la consulta.
+    """
+
+    try:
+        resultados = buscar_observaciones.ejecutar(
+            ascension_recta=ascension_recta,
+            declinacion=declinacion,
+            radio=radio
+        )
+
+        return {
+            "total": len(resultados),
+            "observaciones": resultados
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al consultar IRSA: {str(error)}"
+        )

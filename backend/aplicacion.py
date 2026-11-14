@@ -1,22 +1,30 @@
 
-from dominio import Observacion
+from dominio import Observacion, RepositorioObservaciones
 
 
 class BuscarObservaciones:
+    """
+    Gestiona la búsqueda de productos científicos de SPHEREx.
+    """
 
-    '''Esta función devolverá una lista de todas las observaciones que tengamos registrada'''
-    def ejecutar(self) -> list[Observacion]:
-        return [
-            Observacion(
-                identificador="SPH-001",
-                fecha="2026-11-14",
-                ascension_recta=180.5,
-                declinacion=45.2
-            ),
-            Observacion(
-                identificador="SPH-002",
-                fecha="2026-11-14",
-                ascension_recta=181.2,
-                declinacion=44.8
-            )
-        ]
+    def __init__(self, repositorio: RepositorioObservaciones):
+        """
+        Recibe el repositorio que realizará las consultas.
+        Guarda el repositorio para utilizarlo en las búsquedas.
+        """
+
+        self.repositorio = repositorio
+
+    def ejecutar(self,ascension_recta: float, declinacion: float, radio: float ) -> list[Observacion]:
+        """
+        Solicita observaciones para unas coordenadas y un radio.
+        Devuelve la lista de productos encontrados.
+        """
+
+        return self.repositorio.buscar_por_coordenadas(
+            ascension_recta=ascension_recta,
+            declinacion=declinacion,
+            radio=radio
+        )
+
+    
