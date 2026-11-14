@@ -36,3 +36,13 @@ class RepositorioObservaciones(Protocol):
         Devuelve una lista de observaciones encontradas.
         """
         ...
+
+    def obtener_estructura_fits(
+        self,
+        url_acceso: str
+    ) -> list[dict]:
+        """
+        Inspecciona las extensiones de un archivo FITS.
+        Devuelve una lista con la información de cada extensión.
+        """
+        ...

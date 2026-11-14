@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 from aplicacion import BuscarObservaciones
 from infraestructura import RepositorioIrsa
 
+
 app = FastAPI(
     title="SPHEREx Explorer",
     description="API para explorar y analizar observaciones astronómicas",
@@ -55,4 +56,31 @@ async def obtener_observaciones(
         raise HTTPException(
             status_code=502,
             detail=f"Error al consultar IRSA: {str(error)}"
+        )
+
+
+@app.get("/api/v1/observaciones/estructura-fits")
+async def obtener_estructura_fits(
+    url_acceso: str = Query(
+        ...,
+        description="URL de acceso al archivo FITS de IRSA"
+    )
+):
+    """
+    Inspecciona la estructura de un archivo FITS de SPHEREx.
+    Devuelve información sobre sus extensiones, dimensiones y tipos de datos.
+    """
+
+    try:
+        resultado = buscar_observaciones.inspeccionar_fits(url_acceso)
+
+        return {
+            "total_extensiones": len(resultado),
+            "extensiones": resultado
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al inspeccionar el archivo FITS: {str(error)}"
         )
