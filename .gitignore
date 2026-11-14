@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local astronomy data (large files)
+data/*.fits
+data/*.fit
+data/*.fts
+
+# Environment files
+.env
+.env.*
+!.env.example
