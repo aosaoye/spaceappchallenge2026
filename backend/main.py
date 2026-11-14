@@ -17,7 +17,7 @@ buscar_observaciones = BuscarObservaciones(repositorio)
 
 
 @app.get("/api/v1/estado")
-async def obtener_estado():
+def obtener_estado():
     """
     Comprueba el estado de funcionamiento de la API.
     Devuelve un mensaje con el estado del servicio.
@@ -30,7 +30,7 @@ async def obtener_estado():
 
 
 @app.get("/api/v1/observaciones")
-async def obtener_observaciones(
+def obtener_observaciones(
     ascension_recta: float = Query(..., ge=0, le=360),
     declinacion: float = Query(..., ge=-90, le=90),
     radio: float = Query(1, gt=0, le=3600)
@@ -60,7 +60,7 @@ async def obtener_observaciones(
 
 
 @app.get("/api/v1/observaciones/estructura-fits")
-async def obtener_estructura_fits(
+def obtener_estructura_fits(
     url_acceso: str = Query(
         ...,
         description="URL de acceso al archivo FITS de IRSA"
@@ -88,7 +88,7 @@ async def obtener_estructura_fits(
 
 
 @app.get("/api/v1/observaciones/metadatos-fits")
-async def obtener_metadatos_fits(
+def obtener_metadatos_fits(
     url_acceso: str = Query(
         ...,
         description="URL de acceso al archivo FITS de IRSA"
@@ -114,7 +114,7 @@ async def obtener_metadatos_fits(
 
 
 @app.get("/api/v1/observaciones/analisis-fits")
-async def analizar_imagen_fits(
+def analizar_imagen_fits(
     url_acceso: str = Query(
         ...,
         description="URL de acceso al archivo FITS de IRSA"
@@ -140,7 +140,7 @@ async def analizar_imagen_fits(
 
 
 @app.get("/api/v1/observaciones/analisis-calidad-fits")
-async def analizar_calidad_fits(
+def analizar_calidad_fits(
     url_acceso: str = Query(
         ...,
         description="URL de acceso al archivo FITS de IRSA"
