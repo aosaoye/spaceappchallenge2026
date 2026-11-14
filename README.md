@@ -53,6 +53,8 @@ El FITS de `data/` se conserva como dato local del equipo y no se incluye en Git
 4. Mostrar metadatos y etiquetar hallazgos como candidatos, no como descubrimientos confirmados.
 =======
 # spaceappchallenge2026
+
+```text
 spherex-explorer/
 │
 ├── backend/
@@ -137,4 +139,8 @@ spherex-explorer/
 │
 ├── .gitignore
 └── README.md
+<<<<<<< HEAD
 >>>>>>> cd48368 (Primer commit)
+=======
+```
+>>>>>>> b46de84 (analizar la calidad de los fits con flags para verificar su credibilidad)

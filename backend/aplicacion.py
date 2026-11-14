@@ -48,3 +48,22 @@ class BuscarObservaciones:
         """
 
         return self.repositorio.obtener_metadatos_fits(url_acceso)
+
+
+    def analizar_imagen_fits(self, url_acceso: str) -> dict:
+        """
+        Solicita el análisis estadístico de una imagen FITS al repositorio.
+        Devuelve las estadísticas y el recuento de píxeles.
+        """
+
+        return self.repositorio.analizar_imagen_fits(url_acceso)
+
+
+
+    def analizar_calidad_fits(self, url_acceso: str) -> dict:
+        """
+        Solicita el análisis de calidad de un archivo FITS al repositorio.
+        Devuelve las estadísticas de VARIANCE y la distribución de FLAGS.
+        """
+
+        return self.repositorio.analizar_calidad_fits(url_acceso)

@@ -57,3 +57,26 @@ class RepositorioObservaciones(Protocol):
         Devuelve un diccionario con la información de las cabeceras.
         """
         ...
+
+
+    def analizar_imagen_fits(
+        self,
+        url_acceso: str
+    ) -> dict:
+        """
+        Analiza estadísticamente los píxeles de la imagen científica.
+        Devuelve las estadísticas y el recuento de píxeles válidos y no válidos.
+        """
+        ...
+
+
+
+    def analizar_calidad_fits(
+        self,
+        url_acceso: str
+    ) -> dict:
+        """
+        Analiza las extensiones VARIANCE y FLAGS de un archivo FITS.
+        Devuelve estadísticas de varianza y frecuencias de los indicadores de calidad.
+        """
+        ...
