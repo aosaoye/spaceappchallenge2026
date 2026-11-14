@@ -1,8 +1,18 @@
 
+'''
+Representación y consulta de los datos astronómicos.
+'''
+
 import numpy as np
+
 from astropy import units as u
 from astropy.coordinates import SkyCoord
+from astropy.io import fits
+
 from astroquery.ipac.irsa import Irsa
+
+from urllib.request import urlopen
+from io import BytesIO
 
 from dominio import Observacion
 
@@ -54,6 +64,48 @@ class RepositorioIrsa:
 
         return observaciones
 
+    def descargar_fits(self, url_acceso: str) -> fits.HDUList:
+        """
+        Descarga un archivo FITS desde una URL de IRSA.
+        Devuelve su contenido abierto como una estructura HDUList.
+        """
+
+        with urlopen(url_acceso, timeout=60) as respuesta:
+            contenido = respuesta.read()
+
+        archivo = fits.open(BytesIO(contenido))
+
+        return archivo
+
+    def obtener_estructura_fits(self, url_acceso: str) -> list[dict]:
+        """
+        Inspecciona las extensiones de un archivo FITS.
+        Devuelve una lista con el nombre, las dimensiones y el tipo de datos de cada extensión.
+        """
+
+        archivo = self.descargar_fits(url_acceso)
+
+        try:
+            extensiones = []
+
+            for indice, extension in enumerate(archivo):
+                datos = extension.data
+
+                informacion = {
+                    "indice": indice,
+                    "nombre": extension.name,
+                    "tipo_extension": type(extension).__name__,
+                    "dimensiones": list(datos.shape) if datos is not None else None,
+                    "tipo_datos": str(datos.dtype) if datos is not None else None
+                }
+
+                extensiones.append(informacion)
+
+            return extensiones
+
+        finally:
+            archivo.close()
+
     def _obtener_valor(self, fila, columna):
         """
         Obtiene un valor de una fila de resultados de IRSA.
@@ -66,3 +118,4 @@ class RepositorioIrsa:
             return None
 
         return valor
+
