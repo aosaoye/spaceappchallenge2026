@@ -111,3 +111,55 @@ async def obtener_metadatos_fits(
             status_code=502,
             detail=f"Error al obtener los metadatos FITS: {str(error)}"
         )
+
+
+@app.get("/api/v1/observaciones/analisis-fits")
+async def analizar_imagen_fits(
+    url_acceso: str = Query(
+        ...,
+        description="URL de acceso al archivo FITS de IRSA"
+    )
+):
+    """
+    Analiza estadísticamente los píxeles de una imagen FITS.
+    Devuelve las estadísticas y el recuento de píxeles válidos y no válidos.
+    """
+
+    try:
+        resultado = buscar_observaciones.analizar_imagen_fits(
+            url_acceso
+        )
+
+        return resultado
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al analizar la imagen FITS: {str(error)}"
+        )
+
+
+@app.get("/api/v1/observaciones/analisis-calidad-fits")
+async def analizar_calidad_fits(
+    url_acceso: str = Query(
+        ...,
+        description="URL de acceso al archivo FITS de IRSA"
+    )
+):
+    """
+    Analiza la calidad de los datos de un archivo FITS.
+    Devuelve estadísticas de VARIANCE y la distribución de FLAGS.
+    """
+
+    try:
+        resultado = buscar_observaciones.analizar_calidad_fits(
+            url_acceso
+        )
+
+        return resultado
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al analizar la calidad del FITS: {str(error)}"
+        )

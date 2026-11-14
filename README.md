@@ -1,4 +1,6 @@
 # spaceappchallenge2026
+
+```text
 spherex-explorer/
 │
 ├── backend/
@@ -83,3 +85,4 @@ spherex-explorer/
 │
 ├── .gitignore
 └── README.md
+```
