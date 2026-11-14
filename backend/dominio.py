@@ -46,3 +46,14 @@ class RepositorioObservaciones(Protocol):
         Devuelve una lista con la información de cada extensión.
         """
         ...
+
+    
+    def obtener_metadatos_fits(
+        self,
+        url_acceso: str
+    ) -> dict:
+        """
+        Obtiene los metadatos científicos de las cabeceras FITS.
+        Devuelve un diccionario con la información de las cabeceras.
+        """
+        ...

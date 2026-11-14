@@ -39,3 +39,12 @@ class BuscarObservaciones:
         """
 
         return self.repositorio.obtener_estructura_fits(url_acceso)
+
+
+    def inspeccionar_metadatos_fits(self, url_acceso: str) -> dict:
+        """
+        Solicita la extracción de metadatos de un archivo FITS al repositorio.
+        Devuelve un diccionario con la información científica obtenida.
+        """
+
+        return self.repositorio.obtener_metadatos_fits(url_acceso)

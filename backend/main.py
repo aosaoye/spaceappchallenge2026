@@ -84,3 +84,30 @@ async def obtener_estructura_fits(
             status_code=502,
             detail=f"Error al inspeccionar el archivo FITS: {str(error)}"
         )
+
+
+
+@app.get("/api/v1/observaciones/metadatos-fits")
+async def obtener_metadatos_fits(
+    url_acceso: str = Query(
+        ...,
+        description="URL de acceso al archivo FITS de IRSA"
+    )
+):
+    """
+    Obtiene los metadatos científicos de un archivo FITS.
+    Devuelve información de sus cabeceras y parámetros WCS.
+    """
+
+    try:
+        resultado = buscar_observaciones.inspeccionar_metadatos_fits(
+            url_acceso
+        )
+
+        return resultado
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al obtener los metadatos FITS: {str(error)}"
+        )
