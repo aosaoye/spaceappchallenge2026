@@ -466,46 +466,6 @@ export function buildEpochFrames(
   });
 }
 
-export function buildFallbackObservations(
-  raDeg: number,
-  decDeg: number,
-  bandFilter: string
-): Observacion[] {
-  const epochs = [
-    { week: "2025W18", collection: "spherex_dr1", band: "SPHEREx-D1 (0.75-1.11 um)" },
-    { week: "2025W31", collection: "spherex_dr1", band: "SPHEREx-D2 (1.11-1.64 um)" },
-    { week: "2025W44", collection: "spherex_dr1", band: "SPHEREx-D3 (1.64-2.42 um)" },
-    { week: "2026W05", collection: "spherex_qr3", band: "SPHEREx-D4 (2.42-3.82 um)" },
-    { week: "2026W18", collection: "spherex_qr3", band: "SPHEREx-D5 (3.82-4.42 um)" },
-    { week: "2026W31", collection: "spherex_qr3", band: "SPHEREx-D6 (4.42-5.00 um)" },
-    { week: "2026W44", collection: "spherex_qr3", band: "SPHEREx-D1 (0.75-1.11 um)" },
-    { week: "2027W05", collection: "spherex_qr3", band: "SPHEREx-D2 (1.11-1.64 um)" },
-  ];
-
-  const selectedBand =
-    bandFilter !== "Todas" ? bandFilter : null;
-
-  return epochs.map((ep, idx) => {
-    const band = selectedBand ?? ep.band;
-    const detectorMatch = band.match(/D(\d)/);
-    const detector = detectorMatch ? detectorMatch[1] : String((idx % 6) + 1);
-    const obsId = `${ep.week}_1B_${String(74 + idx * 12).padStart(4, "0")}_${detector}`;
-    return {
-      identificador: obsId,
-      ascension_recta: Number((raDeg + (idx - 3.5) * 0.0004).toFixed(6)),
-      declinacion: Number((decDeg + ((idx % 3) - 1) * 0.0003).toFixed(6)),
-      coleccion: ep.collection,
-      banda_espectral: band,
-      tipo_producto: "spectral_image_l2b",
-      url_acceso: `https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/${ep.week}_1B/l2b-v27-2026-196/${detector}/level2_${obsId}D1_spx_l2b-v27-2026-196.fits`,
-      tamano_estimado: 60157440,
-      url_imagen_png: `/api/v1/observaciones/imagen?fits_url=${encodeURIComponent(
-        `https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/level2/${ep.week}_1B/l2b-v27-2026-196/${detector}/level2_${obsId}D1_spx_l2b-v27-2026-196.fits`
-      )}`,
-    };
-  });
-}
-
 export function angularDistanceArcsec(
   ra1: number,
   dec1: number,

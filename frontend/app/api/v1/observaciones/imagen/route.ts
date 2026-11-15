@@ -1,9 +1,9 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
 
 const BACKEND_BASE =
-  process.env.SPHEREX_BACKEND_URL || "http://127.0.0.1:8000";
+  process.env.SPHEREX_BACKEND_URL ||
+  process.env.BACKEND_URL ||
+  "http://127.0.0.1:8000";
 
 export async function GET(request: NextRequest) {
   const fitsUrl = request.nextUrl.searchParams.get("fits_url") || "";
@@ -16,67 +16,43 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const isPrecomputedOrSynthetic =
-    fitsUrl.includes("2025W41_2B_0509_2") ||
-    fitsUrl.includes("2025W18_1B_0074") ||
-    fitsUrl.includes("2025W31_1B_0086") ||
-    fitsUrl.includes("2025W44_1B_0098") ||
-    fitsUrl.includes("2026W05_1B_0110") ||
-    fitsUrl.includes("2026W18_1B_0122") ||
-    fitsUrl.includes("2026W31_1B_0134") ||
-    fitsUrl.includes("2026W44_1B_0146") ||
-    fitsUrl.includes("2027W05_1B_0158") ||
-    fitsUrl.includes("2027W18_1B_0170");
-
-  if (!isPrecomputedOrSynthetic) {
-    try {
-      const upstream = await fetch(
-        `${BACKEND_BASE}/api/v1/observaciones/imagen?fits_url=${encodeURIComponent(
-          fitsUrl
-        )}&modo=${encodeURIComponent(modo)}`,
-        {
-          cache: "force-cache",
-          signal: AbortSignal.timeout(4500),
-        }
-      );
-
-      if (upstream.ok) {
-        const bytes = await upstream.arrayBuffer();
-        return new NextResponse(bytes, {
-          status: 200,
-          headers: {
-            "Content-Type": "image/png",
-            "Cache-Control": "public, max-age=3600",
-          },
-        });
-      }
-    } catch {
-      // Si el backend Python no está activo o expira el tiempo, servir el PNG procesado local
-    }
-  }
-
   try {
-    const fileName =
-      modo === "longitud_onda"
-        ? "2025W41_2B_0509_2_D1_wavelength.png"
-        : "2025W41_2B_0509_2_D1_preview.png";
-    const fallbackPath = path.join(
-      process.cwd(),
-      "public",
-      "processed",
-      fileName
+    const upstream = await fetch(
+      `${BACKEND_BASE}/api/v1/observaciones/imagen?fits_url=${encodeURIComponent(
+        fitsUrl
+      )}&modo=${encodeURIComponent(modo)}`,
+      {
+        cache: "no-store",
+        signal: AbortSignal.timeout(120000),
+      }
     );
-    const fileBuffer = await readFile(fallbackPath);
-    return new NextResponse(fileBuffer, {
+
+    if (!upstream.ok) {
+      let errorPayload: unknown = { detail: "No se pudo obtener la imagen PNG del backend" };
+      try {
+        errorPayload = await upstream.json();
+      } catch {
+        // mantener detalle por defecto si la respuesta de error no es JSON
+      }
+      return NextResponse.json(errorPayload, { status: upstream.status });
+    }
+
+    const bytes = await upstream.arrayBuffer();
+    return new NextResponse(bytes, {
       status: 200,
       headers: {
         "Content-Type": "image/png",
         "Cache-Control": "public, max-age=3600",
       },
     });
-  } catch {
+  } catch (error) {
     return NextResponse.json(
-      { detail: "No se pudo obtener la imagen PNG" },
+      {
+        detail:
+          error instanceof Error
+            ? `Error al conectar con el backend: ${error.message}`
+            : "No se pudo obtener la imagen PNG del backend",
+      },
       { status: 502 }
     );
   }

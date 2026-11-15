@@ -35,7 +35,6 @@ import AladinSkyMap, {
 import { tryParseViewParams } from "@/lib/astronomy/parse-view-params";
 import {
   buildEpochFrames,
-  buildFallbackObservations,
   CHALLENGE_TARGETS,
   ChallengeTarget,
   findMatchingChallengeTarget,
@@ -82,14 +81,12 @@ function FitsPngFrameView({
   );
   const pngUrl = getFitsPngUrl(observacion, modoRender);
   const [currentSrc, setCurrentSrc] = useState(pngUrl);
-  const [usingStaticPreview, setUsingStaticPreview] = useState(false);
   const [status, setStatus] = useState<"loading" | "loaded" | "error">(
     "loading"
   );
 
   function handleChangeModo(nextModo: "flujo" | "longitud_onda") {
     setModoRender(nextModo);
-    setUsingStaticPreview(false);
     setCurrentSrc(getFitsPngUrl(observacion, nextModo));
     setStatus("loading");
   }
@@ -153,15 +150,7 @@ function FitsPngFrameView({
             height={1000}
             unoptimized
             onLoad={() => setStatus("loaded")}
-            onError={() => {
-              if (!usingStaticPreview) {
-                setUsingStaticPreview(true);
-                setCurrentSrc("/spherex_D1_preview.png");
-                setStatus("loading");
-              } else {
-                setStatus("error");
-              }
-            }}
+            onError={() => setStatus("error")}
             className={`max-h-[480px] w-auto rounded object-contain transition-opacity ${
               status === "loaded" ? "opacity-100" : "opacity-0"
             }`}
@@ -170,9 +159,7 @@ function FitsPngFrameView({
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-foreground/70 font-mono">
         <span>
-          {usingStaticPreview
-            ? "Mostrando spherex_D1_preview.png (2025W41_2B_0509_2 · 2040×2040 · 0.228–2.188 MJy/sr)"
-            : modoRender === "longitud_onda"
+          {modoRender === "longitud_onda"
             ? "Mapa WCS espectral key='W' (WCS-WAVE · sip=None · longitud de onda por píxel)"
             : "Renderizado en backend: AsinhStretch · percentiles [1, 99.5] · MJy/sr"}
         </span>
@@ -216,11 +203,9 @@ export default function WiseViewExplorer() {
   // Backend & observation state
   const [loading, setLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string>(
-    "Secuencia SPHEREx cargada · 8 imágenes multiépoca listas para reproducción."
+    "Conectando con el backend para consultar observaciones SPHEREx en IRSA…"
   );
-  const [rawObservations, setRawObservations] = useState<Observacion[]>(() =>
-    buildFallbackObservations(initialTarget.raDeg, initialTarget.decDeg, "Todas")
-  );
+  const [rawObservations, setRawObservations] = useState<Observacion[]>([]);
   const [dataSource, setDataSource] = useState<"irsa" | "fallback">("irsa");
 
   // Filter & image display controls
@@ -410,37 +395,41 @@ export default function WiseViewExplorer() {
         const response = await fetch(`/api/v1/observaciones?${params.toString()}`);
 
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          let errDetail = `HTTP ${response.status}`;
+          try {
+            const errJson = await response.json();
+            if (errJson?.detail) errDetail = String(errJson.detail);
+          } catch {
+            // ignorar si no es JSON
+          }
+          throw new Error(errDetail);
         }
 
         const payload: ObservacionesResponse = await response.json();
-        if (payload.observaciones && payload.observaciones.length > 0) {
-          setRawObservations(payload.observaciones);
-          setDataSource("irsa");
+        const obsList = Array.isArray(payload.observaciones)
+          ? payload.observaciones
+          : [];
+        setRawObservations(obsList);
+        setDataSource("irsa");
+        if (obsList.length > 0) {
           setStatusMessage(
-            `${payload.total} imágenes SPHEREx cargadas para ${formatRAHMS(
+            `${payload.total ?? obsList.length} observaciones reales cargadas desde el backend para ${formatRAHMS(
               raDeg
             )}, ${formatDecDMS(decDeg)}.`
           );
-          return;
+        } else {
+          setStatusMessage(
+            `El backend devolvió 0 observaciones en IRSA para ${formatRAHMS(
+              raDeg
+            )}, ${formatDecDMS(decDeg)}.`
+          );
         }
-
-        const fallback = buildFallbackObservations(raDeg, decDeg, "Todas");
-        setRawObservations(fallback);
-        setDataSource("irsa");
+      } catch (err) {
+        setRawObservations([]);
         setStatusMessage(
-          `${fallback.length} imágenes SPHEREx multiépoca cargadas para ${formatRAHMS(
-            raDeg
-          )}, ${formatDecDMS(decDeg)}.`
-        );
-      } catch {
-        const fallback = buildFallbackObservations(raDeg, decDeg, "Todas");
-        setRawObservations(fallback);
-        setDataSource("irsa");
-        setStatusMessage(
-          `${fallback.length} imágenes SPHEREx multiépoca cargadas para ${formatRAHMS(
-            raDeg
-          )}, ${formatDecDMS(decDeg)}.`
+          err instanceof Error
+            ? `Error al consultar el backend: ${err.message}`
+            : "Error al consultar el backend de observaciones."
         );
       } finally {
         setLoading(false);
@@ -629,20 +618,9 @@ export default function WiseViewExplorer() {
   }
 
   const currentFrame = frames[safeFrameIndex];
-
-  // Precargar en el Web Worker la imagen PNG y metadatos de la observación activa y adyacentes
-  useEffect(() => {
-    if (!currentFrame || !preloaderWorkerRef.current) return;
-    const obsUrl = currentFrame.observacion.url_acceso;
-    const encoded = encodeURIComponent(obsUrl);
-    preloaderWorkerRef.current.postMessage({
-      urls: [
-        getFitsPngUrl(currentFrame.observacion, "flujo"),
-        `/api/v1/observaciones/estructura-fits?url_acceso=${encoded}`,
-        `/api/v1/observaciones/metadatos-fits?url_acceso=${encoded}`,
-      ],
-    });
-  }, [currentFrame]);
+  const inspectedObservacion =
+    (isPlaying ? frames[0]?.observacion : currentFrame?.observacion) ??
+    currentFrame?.observacion;
   const midYears =
     frames.length > 0
       ? frames[Math.floor((frames.length - 1) / 2)].yearsFromRef
@@ -1983,9 +1961,9 @@ export default function WiseViewExplorer() {
             </section>
           )}
 
-          {/* Scientific FITS MEF Structure & Metadata Inspector (from backend zip + spherex_intro.md) */}
-          {currentFrame && (
-            <FitsScientificInspector observacion={currentFrame.observacion} />
+          {/* Scientific FITS MEF Structure & Metadata Inspector */}
+          {inspectedObservacion && (
+            <FitsScientificInspector observacion={inspectedObservacion} />
           )}
 
           {/* Observations Table */}

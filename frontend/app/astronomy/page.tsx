@@ -6,11 +6,12 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import {
   buildEpochFrames,
-  buildFallbackObservations,
   CHALLENGE_TARGETS,
   findMatchingChallengeTarget,
   formatDecDMS,
   formatRAHMS,
+  Observacion,
+  ObservacionesResponse,
 } from "@/app/astronomy";
 import CustomSelect from "@/app/components/CustomSelect";
 import SkyVideoCanvas from "@/app/components/SkyVideoCanvas";
@@ -28,11 +29,35 @@ export default function AstronomyPage() {
   const [urlError, setUrlError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [mode360, setMode360] = useState<"r3f-360" | "aladin">("r3f-360");
+  const [observations, setObservations] = useState<Observacion[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadObs() {
+      try {
+        const params = new URLSearchParams({
+          ascension_recta: ra.toFixed(6),
+          declinacion: dec.toFixed(6),
+          radio: "60",
+        });
+        const res = await fetch(`/api/v1/observaciones?${params.toString()}`);
+        if (res.ok && !cancelled) {
+          const data: ObservacionesResponse = await res.json();
+          setObservations(Array.isArray(data.observaciones) ? data.observaciones : []);
+        }
+      } catch {
+        if (!cancelled) setObservations([]);
+      }
+    }
+    loadObs();
+    return () => {
+      cancelled = true;
+    };
+  }, [ra, dec]);
 
   const frames360 = useMemo(() => {
-    const obs = buildFallbackObservations(ra, dec, "Todas");
-    return buildEpochFrames(obs, "irsa");
-  }, [ra, dec]);
+    return buildEpochFrames(observations, "irsa");
+  }, [observations]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;

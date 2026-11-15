@@ -99,7 +99,14 @@ export default function FitsScientificInspector({
       ]);
 
       if (!resEst.ok || !resMeta.ok) {
-        throw new Error("No se pudo inspeccionar el archivo FITS");
+        let detail = "No se pudo inspeccionar el archivo FITS desde el backend";
+        try {
+          const errJson = await (!resEst.ok ? resEst : resMeta).json();
+          if (errJson?.detail) detail = String(errJson.detail);
+        } catch {
+          // mantener mensaje por defecto
+        }
+        throw new Error(detail);
       }
 
       const dataEst: EstructuraFitsResponse = await resEst.json();
@@ -119,7 +126,7 @@ export default function FitsScientificInspector({
       setError(
         err instanceof Error
           ? err.message
-          : "Error al consultar la estructura y metadatos FITS"
+          : "Error al consultar la estructura y metadatos FITS en el backend"
       );
     } finally {
       setLoading(false);
@@ -141,7 +148,14 @@ export default function FitsScientificInspector({
         ]);
 
         if (!resEst.ok || !resMeta.ok) {
-          throw new Error("No se pudo inspeccionar el archivo FITS");
+          let detail = "No se pudo inspeccionar el archivo FITS desde el backend";
+          try {
+            const errJson = await (!resEst.ok ? resEst : resMeta).json();
+            if (errJson?.detail) detail = String(errJson.detail);
+          } catch {
+            // mantener mensaje por defecto
+          }
+          throw new Error(detail);
         }
 
         const dataEst: EstructuraFitsResponse = await resEst.json();
@@ -165,7 +179,7 @@ export default function FitsScientificInspector({
           setError(
             err instanceof Error
               ? err.message
-              : "Error al consultar la estructura y metadatos FITS"
+              : "Error al consultar la estructura y metadatos FITS en el backend"
           );
         }
       }
