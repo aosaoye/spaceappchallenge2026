@@ -48,6 +48,7 @@ import {
 } from "../astronomy";
 import CustomSelect from "./CustomSelect";
 import FitsScientificInspector from "./FitsScientificInspector";
+import PanStarrsViewer from "./PanStarrsViewer";
 import SkyVideoCanvas, {
   ColormapMode,
   computeTargetFluxMultiplier,
@@ -212,6 +213,7 @@ export default function WiseViewExplorer() {
   const [viewerMode, setViewerMode] = useState<"canvas" | "fits-png" | "aladin">(
     "canvas"
   );
+  const [showPanStarrs, setShowPanStarrs] = useState(false);
   const [view360, setView360] = useState(false);
   const [collectionFilter, setCollectionFilter] = useState("Todas");
   const [bandFilter, setBandFilter] = useState("Todas");
@@ -513,6 +515,8 @@ export default function WiseViewExplorer() {
           modeParam === "canvas"
         ) {
           setViewerMode(modeParam);
+        } else if (modeParam === "panstarrs") {
+          setShowPanStarrs(true);
         }
       }
 
@@ -791,31 +795,50 @@ export default function WiseViewExplorer() {
 
       {audienceMode === "public" ? (
         /* Modo Paseo Estelar: el visor ocupa todo el viewport (100vh) sin ruido lateral */
-        <div className="relative h-[calc(100vh-53px)] w-full overflow-hidden">
+        <div
+          className={`relative w-full ${
+            showPanStarrs
+              ? "min-h-[calc(100vh-53px)] pb-24"
+              : "h-[calc(100vh-53px)] overflow-hidden"
+          }`}
+        >
           {frames.length > 0 && currentFrame && (
-            <SkyVideoCanvas
-              key={`public-${activeRaDeg.toFixed(6)}:${activeDecDeg.toFixed(6)}`}
-              centerRaDeg={activeRaDeg}
-              centerDecDeg={activeDecDeg}
-              frames={frames}
-              currentFrameIndex={safeFrameIndex}
-              referenceFrameIndex={0}
-              activeTarget={activeTarget}
-              fovArcsec={fovArcsec}
-              stretchGain={stretchGain}
-              colormap={colormap}
-              playbackMode={playbackMode}
-              showCrosshair={showCrosshair}
-              showGrid={showGrid}
-              showTargetOverlay={showTargetOverlay}
-              showHistoricalCatalogOverlay={showHistoricalCatalogOverlay}
-              stackByDetector={stackByDetector}
-              selectedSource={effectiveSelectedSource}
-              onSelectSkySource={(src) => setCustomSelectedSource(src)}
-              onZoomChange={setFovArcsec}
-              fullViewport
-              view360={view360}
-            />
+            <div className={showPanStarrs ? "h-[58vh] w-full" : "h-full w-full"}>
+              <SkyVideoCanvas
+                key={`public-${activeRaDeg.toFixed(6)}:${activeDecDeg.toFixed(6)}`}
+                centerRaDeg={activeRaDeg}
+                centerDecDeg={activeDecDeg}
+                frames={frames}
+                currentFrameIndex={safeFrameIndex}
+                referenceFrameIndex={0}
+                activeTarget={activeTarget}
+                fovArcsec={fovArcsec}
+                stretchGain={stretchGain}
+                colormap={colormap}
+                playbackMode={playbackMode}
+                showCrosshair={showCrosshair}
+                showGrid={showGrid}
+                showTargetOverlay={showTargetOverlay}
+                showHistoricalCatalogOverlay={showHistoricalCatalogOverlay}
+                stackByDetector={stackByDetector}
+                selectedSource={effectiveSelectedSource}
+                onSelectSkySource={(src) => setCustomSelectedSource(src)}
+                onZoomChange={setFovArcsec}
+                fullViewport
+                view360={view360}
+              />
+            </div>
+          )}
+
+          {showPanStarrs && (
+            <div className="mx-auto max-w-6xl px-4 py-4">
+              <PanStarrsViewer
+                ra={activeRaDeg}
+                dec={activeDecDeg}
+                fovArcsec={fovArcsec}
+                compact
+              />
+            </div>
           )}
 
           {/* Barra flotante simplificada con iconos heredados de CustomSelect */}
@@ -1094,6 +1117,23 @@ export default function WiseViewExplorer() {
                   setCurrentFrameIndex(0);
                 }}
               />
+
+              {/* 5. Botón Pan-STARRS1 (Comparación óptica lado a lado / debajo, igual que WiseView) */}
+              <button
+                type="button"
+                title="Comparar con Pan-STARRS1 (imágenes ópticas y FITS)"
+                aria-label="Comparar con Pan-STARRS1"
+                aria-pressed={showPanStarrs}
+                onClick={() => setShowPanStarrs((prev) => !prev)}
+                className={`inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-full border border-black/[.1] px-3 text-xs font-medium transition-colors dark:border-white/[.16] ${
+                  showPanStarrs
+                    ? "bg-foreground text-background"
+                    : "bg-background text-foreground hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a]"
+                }`}
+              >
+                <ImageIcon className="h-4 w-4" />
+                <span className="hidden sm:inline">Pan-STARRS1</span>
+              </button>
 
               <div className="mx-0.5 h-5 w-px bg-black/[.1] dark:bg-white/[.16]" />
 
@@ -1762,6 +1802,19 @@ export default function WiseViewExplorer() {
                   <Globe className="h-3.5 w-3.5" />
                   <span>Aladin Lite v3</span>
                 </button>
+                <button
+                  type="button"
+                  aria-pressed={showPanStarrs}
+                  onClick={() => setShowPanStarrs((prev) => !prev)}
+                  className={`inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors ${
+                    showPanStarrs
+                      ? "bg-foreground text-background"
+                      : "border border-black/[.08] hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
+                  }`}
+                >
+                  <ImageIcon className="h-3.5 w-3.5" />
+                  <span>Pan-STARRS1</span>
+                </button>
               </div>
             </div>
 
@@ -1869,6 +1922,15 @@ export default function WiseViewExplorer() {
                 view360={view360}
               />
             )
+          )}
+
+          {/* Panel de comparación Pan-STARRS1 debajo del visor principal (igual que WiseView) */}
+          {showPanStarrs && (
+            <PanStarrsViewer
+              ra={activeRaDeg}
+              dec={activeDecDeg}
+              fovArcsec={fovArcsec}
+            />
           )}
 
           {/* Agrupación por detectores (D1–D6) y Espectro Infrarrojo SPHEREx (102 canales LVF) */}

@@ -93,8 +93,10 @@ export default function CustomSelect({
         onClick={() => setOpen((prev) => !prev)}
         className={
           iconOnly
-            ? `inline-flex cursor-pointer items-center justify-center rounded-full border border-black/[.1] bg-background text-foreground transition-colors hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.16] dark:hover:bg-[#1a1a1a] ${
-                open ? "bg-foreground text-background hover:bg-foreground dark:hover:bg-foreground" : ""
+            ? `inline-flex cursor-pointer items-center justify-center rounded-full border border-black/[.1] transition-colors focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.16] ${
+                open
+                  ? "bg-foreground text-background hover:bg-foreground dark:hover:bg-foreground"
+                  : "bg-background text-foreground hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a]"
               } ${triggerClassName || "h-10 w-10"}`
             : `inline-flex h-10 w-full cursor-pointer items-center justify-between gap-2 rounded-full border border-black/[.08] bg-background px-4 text-left text-sm font-medium text-foreground transition-colors hover:bg-[#f2f2f2] focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.145] dark:hover:bg-[#1a1a1a] ${triggerClassName}`
         }

@@ -1,4 +1,3 @@
-
 from dominio import Observacion, RepositorioObservaciones
 
 
@@ -40,7 +39,6 @@ class BuscarObservaciones:
 
         return self.repositorio.obtener_estructura_fits(url_acceso)
 
-
     def inspeccionar_metadatos_fits(self, url_acceso: str) -> dict:
         """
         Solicita la extracción de metadatos de un archivo FITS al repositorio.
@@ -48,7 +46,6 @@ class BuscarObservaciones:
         """
 
         return self.repositorio.obtener_metadatos_fits(url_acceso)
-
 
     def analizar_imagen_fits(self, url_acceso: str) -> dict:
         """
@@ -58,8 +55,6 @@ class BuscarObservaciones:
 
         return self.repositorio.analizar_imagen_fits(url_acceso)
 
-
-
     def analizar_calidad_fits(self, url_acceso: str) -> dict:
         """
         Solicita el análisis de calidad de un archivo FITS al repositorio.
@@ -67,3 +62,26 @@ class BuscarObservaciones:
         """
 
         return self.repositorio.analizar_calidad_fits(url_acceso)
+
+
+class ConvertirFitsAPng:
+    """
+    Gestiona la conversión de un archivo FITS de SPHEREx a imagen PNG.
+    """
+
+    def __init__(self, repositorio: RepositorioObservaciones):
+        """
+        Recibe el repositorio encargado de leer y renderizar el FITS.
+        """
+
+        self.repositorio = repositorio
+
+    def ejecutar(self, url_fits: str, modo: str = "flujo") -> bytes:
+        """
+        Convierte el archivo FITS indicado en una imagen PNG en bytes.
+        """
+
+        return self.repositorio.convertir_fits_a_png(
+            url_fits=url_fits,
+            modo=modo
+        )

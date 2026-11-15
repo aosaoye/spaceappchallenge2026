@@ -1,19 +1,27 @@
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi import FastAPI, HTTPException, Query
-
-from aplicacion import BuscarObservaciones
+from aplicacion import BuscarObservaciones, ConvertirFitsAPng
 from infraestructura import RepositorioIrsa
-
 
 app = FastAPI(
     title="SPHEREx Explorer",
-    description="API para explorar y analizar observaciones astronómicas",
+    description="API para explorar, inspeccionar y analizar observaciones astronómicas de SPHEREx",
     version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Inyección de dependencias
 repositorio = RepositorioIrsa()
 buscar_observaciones = BuscarObservaciones(repositorio)
+convertir_fits_a_png = ConvertirFitsAPng(repositorio)
 
 
 @app.get("/api/v1/estado")
@@ -67,8 +75,9 @@ def obtener_estructura_fits(
     )
 ):
     """
-    Inspecciona la estructura de un archivo FITS de SPHEREx.
-    Devuelve información sobre sus extensiones, dimensiones y tipos de datos.
+    Inspecciona la estructura de un archivo FITS Multi-Extensión (MEF) de SPHEREx.
+    Devuelve información sobre sus extensiones (IMAGE, FLAGS, VARIANCE, ZODI, EPSF, WCS-WAVE),
+    dimensiones y tipos de datos.
     """
 
     try:
@@ -79,12 +88,16 @@ def obtener_estructura_fits(
             "extensiones": resultado
         }
 
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
     except Exception as error:
         raise HTTPException(
             status_code=502,
             detail=f"Error al inspeccionar el archivo FITS: {str(error)}"
         )
-
 
 
 @app.get("/api/v1/observaciones/metadatos-fits")
@@ -95,8 +108,9 @@ def obtener_metadatos_fits(
     )
 ):
     """
-    Obtiene los metadatos científicos de un archivo FITS.
-    Devuelve información de sus cabeceras y parámetros WCS.
+    Obtiene los metadatos científicos de un archivo FITS de SPHEREx.
+    Devuelve información de sus cabeceras, parámetros WCS espaciales,
+    WCS espectral (LVF / WCS-WAVE) y banderas de procesamiento.
     """
 
     try:
@@ -106,6 +120,11 @@ def obtener_metadatos_fits(
 
         return resultado
 
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
     except Exception as error:
         raise HTTPException(
             status_code=502,
@@ -132,6 +151,11 @@ def analizar_imagen_fits(
 
         return resultado
 
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
     except Exception as error:
         raise HTTPException(
             status_code=502,
@@ -158,8 +182,41 @@ def analizar_calidad_fits(
 
         return resultado
 
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
     except Exception as error:
         raise HTTPException(
             status_code=502,
             detail=f"Error al analizar la calidad del FITS: {str(error)}"
+        )
+
+
+@app.get("/api/v1/observaciones/imagen")
+def obtener_imagen_observacion(
+    fits_url: str = Query(..., description="URL del archivo FITS de SPHEREx"),
+    modo: str = Query("flujo", description="Modo de visualización: 'flujo' o 'longitud_onda'")
+):
+    """
+    Descarga un producto FITS de SPHEREx, lo normaliza y devuelve la imagen en formato PNG.
+    """
+
+    try:
+        png_bytes = convertir_fits_a_png.ejecutar(url_fits=fits_url, modo=modo)
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"}
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error al convertir el FITS a PNG: {str(error)}"
         )

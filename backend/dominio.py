@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -18,11 +17,13 @@ class Observacion:
     tipo_producto: str
     url_acceso: str
     tamano_estimado: int | None
+    url_imagen_png: str | None = None
 
 
 class RepositorioObservaciones(Protocol):
     """
-    Define las operaciones disponibles para consultar observaciones.
+    Define las operaciones disponibles para consultar observaciones,
+    inspeccionar extensiones/metadatos FITS (MEF) y generar imágenes PNG.
     """
 
     def buscar_por_coordenadas(
@@ -42,22 +43,20 @@ class RepositorioObservaciones(Protocol):
         url_acceso: str
     ) -> list[dict]:
         """
-        Inspecciona las extensiones de un archivo FITS.
+        Inspecciona las extensiones de un archivo FITS Multi-Extensión (MEF).
         Devuelve una lista con la información de cada extensión.
         """
         ...
 
-    
     def obtener_metadatos_fits(
         self,
         url_acceso: str
     ) -> dict:
         """
-        Obtiene los metadatos científicos de las cabeceras FITS.
-        Devuelve un diccionario con la información de las cabeceras.
+        Obtiene los metadatos científicos de las cabeceras FITS,
+        incluyendo WCS espacial, WCS espectral (LVF) y banderas de calidad.
         """
         ...
-
 
     def analizar_imagen_fits(
         self,
@@ -69,8 +68,6 @@ class RepositorioObservaciones(Protocol):
         """
         ...
 
-
-
     def analizar_calidad_fits(
         self,
         url_acceso: str
@@ -78,5 +75,16 @@ class RepositorioObservaciones(Protocol):
         """
         Analiza las extensiones VARIANCE y FLAGS de un archivo FITS.
         Devuelve estadísticas de varianza y frecuencias de los indicadores de calidad.
+        """
+        ...
+
+    def convertir_fits_a_png(
+        self,
+        url_fits: str,
+        modo: str = "flujo"
+    ) -> bytes:
+        """
+        Descarga o lee un producto FITS de SPHEREx y lo convierte en PNG.
+        Soporta modo 'flujo' (AsinhStretch) y 'longitud_onda' (mapa WCS-WAVE).
         """
         ...

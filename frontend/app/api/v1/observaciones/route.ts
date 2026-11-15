@@ -9,13 +9,23 @@ export async function GET(request: NextRequest) {
   const search = request.nextUrl.searchParams.toString();
 
   try {
-    const upstream = await fetch(
+    let upstream = await fetch(
       `${BACKEND_URL}/api/v1/observaciones?${search}`,
       {
         signal: AbortSignal.timeout(60000),
         cache: "no-store",
       }
     );
+
+    if (upstream.status >= 502 && upstream.status <= 504) {
+      upstream = await fetch(
+        `${BACKEND_URL}/api/v1/observaciones?${search}`,
+        {
+          signal: AbortSignal.timeout(60000),
+          cache: "no-store",
+        }
+      );
+    }
 
     const data = await upstream.json();
     return NextResponse.json(data, { status: upstream.status });
