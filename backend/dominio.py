@@ -18,6 +18,10 @@ class Observacion:
     url_acceso: str
     tamano_estimado: int | None
     url_imagen_png: str | None = None
+    fecha_observacion: str | None = None
+    fecha_fin_observacion: str | None = None
+    mjd_inicio: float | None = None
+    mjd_fin: float | None = None
 
 
 class RepositorioObservaciones(Protocol):

@@ -1,43 +1,28 @@
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 60d5e2f (Merge readme arreglado)
-# SPHEREx Time Viewer
+# SPHEREx Explorer
 
-Visor web para explorar una región del cielo y comparar observaciones de SPHEREx en distintas fechas y bandas, inspirado en el flujo de uso de WiseView.
+Visor web para explorar productos públicos SPHEREx y comparar sus imágenes, bandas y metadatos. El backend principal es `backend/`; `data/spaceappchallenge2026-backend (1).zip` conserva una copia anterior con una implementación reducida y se mantiene sin extraer ni sobrescribir.
 
-## Estructura
-<<<<<<< HEAD
+## Estructura principal
 
-```text
-.
-├── data/                 # Datos FITS originales y muestras pequeñas
-├── backend/              # API Python (FastAPI)
-├── frontend/             # Interfaz React + TypeScript
-├── notebooks/            # Exploración y preparación de datos
-└── index.ipynb           # Notebook existente del equipo
-```
+- `backend/dominio.py`: entidad `Observacion` y contrato del repositorio.
+- `backend/aplicacion.py`: casos de uso.
+- `backend/infraestructura.py`: consulta IRSA, descargas, lectura FITS y análisis.
+- `backend/main.py`: aplicación FastAPI y endpoints.
+- `backend/configuracion.py`: configuración desde variables de entorno.
 
-## Requisitos
-
-- Node.js 20 o superior
-- Python 3.11 o superior
-
-## Arranque
-
-### API
+## Ejecución local
 
 ```powershell
 cd backend
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn main:app --reload
 ```
 
-La API queda en `http://localhost:8000`; la documentación interactiva en `/docs`.
+La API queda en `http://localhost:8000` y OpenAPI en `/docs`. Para las pruebas, instala `pip install -r requirements-dev.txt` y ejecuta `python -m pytest ..\tests` desde `backend`.
 
-### Interfaz
+## Interfaz web
 
 ```powershell
 cd frontend
@@ -45,155 +30,28 @@ npm install
 npm run dev
 ```
 
-## Datos
+## Configuración
 
-El FITS de `data/` se conserva como dato local del equipo y no se incluye en Git. Consultad su licencia, procedencia y metadatos antes de redistribuirlo. La interfaz inicial puede trabajar con imágenes de muestra; indicad siempre si una imagen o candidato es simulado.
+| Variable | Predeterminado | Uso |
+|---|---|---|
+| `SPHEREX_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Orígenes CORS separados por coma |
+| `SPHEREX_TIMEOUT_DESCARGA` | `90` | Tiempo máximo por intento de descarga en segundos |
+| `SPHEREX_MAX_FITS_BYTES` | `536870912` | Tamaño máximo permitido por archivo FITS |
+| `SPHEREX_CACHE_FITS_BYTES` | `536870912` | Presupuesto aproximado de bytes para FITS en caché |
+| `SPHEREX_CACHE_FITS` | `2` | Cantidad máxima de FITS en caché |
+| `SPHEREX_CACHE_PNG` | `8` | Cantidad máxima de PNG en caché |
+| `SPHEREX_FITS_LOCAL` | vacío | Ruta opcional a la muestra local conocida |
+| `SPHEREX_PRECARGA_LOCAL` | `false` | Activa el procesamiento de la muestra local al arrancar |
+| `SPHEREX_LOG_LEVEL` | `INFO` | Nivel de logging de Python |
+| `SPHEREX_TRABAJADORES` | `1` en Docker | Procesos Uvicorn en el contenedor |
 
-## Flujo previsto
+`GET /api/v1/observaciones` usa IRSA sin reducir el radio si la consulta falla. Las fechas ISO y límites `mjd_inicio`/`mjd_fin` se incluyen solo cuando IRSA proporciona metadatos temporales explícitos; de lo contrario son `null`. Los encabezados FITS se exponen en metadatos, incluido `DATE-OBS` cuando está disponible. Las imágenes están disponibles en `GET /api/v1/observaciones/imagen` con `modo=flujo` o `modo=longitud_onda` (este último requiere WCS-WAVE).
 
-1. Seleccionar una región del cielo.
-2. Elegir dos épocas y una banda.
-3. Comparar las imágenes y revisar posibles objetos móviles.
-4. Mostrar metadatos y etiquetar hallazgos como candidatos, no como descubrimientos confirmados.
-=======
-# spaceappchallenge2026
+## Contenedor
 
-```text
-spherex-explorer/
-│
-├── backend/
-│   ├── src/
-│   │   └── spherex/
-│   │       │
-│   │       ├── domain/
-│   │       │   ├── entities/
-│   │       │   │   ├── observation.py
-│   │       │   │   └── candidate.py
-│   │       │   │
-│   │       │   ├── value_objects/
-│   │       │   │   ├── coordinates.py
-│   │       │   │   └── sky_region.py
-│   │       │   │
-│   │       │   └── exceptions/
-│   │       │       └── domain_exceptions.py
-│   │       │
-│   │       ├── application/
-│   │       │   ├── ports/
-│   │       │   │   ├── input/
-│   │       │   │   │   ├── search_observations.py
-│   │       │   │   │   └── detect_candidates.py
-│   │       │   │   │
-│   │       │   │   └── output/
-│   │       │   │       ├── observation_repository.py
-│   │       │   │       └── image_processor.py
-│   │       │   │
-│   │       │   └── use_cases/
-│   │       │       ├── search_observations_use_case.py
-│   │       │       └── detect_candidates_use_case.py
-│   │       │
-│   │       ├── infrastructure/
-│   │       │   ├── adapters/
-│   │       │   │   ├── input/
-│   │       │   │   │   └── api/
-│   │       │   │   │       ├── routes/
-│   │       │   │   │       │   ├── observations.py
-│   │       │   │   │       │   └── candidates.py
-│   │       │   │   │       └── schemas/
-│   │       │   │   │           └── observation_schema.py
-│   │       │   │   │
-│   │       │   │   └── output/
-│   │       │   │       ├── irsa/
-│   │       │   │       │   └── irsa_adapter.py
-│   │       │   │       │
-│   │       │   │       └── scientific/
-│   │       │   │           ├── fits_adapter.py
-│   │       │   │           └── image_processing_adapter.py
-│   │       │   │
-│   │       │   └── config/
-│   │       │       └── settings.py
-│   │       │
-│   │       └── main.py
-│   │
-│   ├── tests/
-│   │   ├── unit/
-│   │   └── integration/
-│   │
-│   ├── requirements.txt
-│   └── pyproject.toml
-│
-├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── SkyViewer/
-│   │   │   ├── ImageComparator/
-│   │   │   ├── CandidateList/
-│   │   │   └── CandidateDetails/
-│   │   │
-│   │   ├── pages/
-│   │   ├── services/
-│   │   ├── hooks/
-│   │   ├── types/
-│   │   └── App.tsx
-│   │
-│   └── package.json
-│
-├── docs/
-│   ├── architecture.md
-│   └── api.md
-│
-├── .gitignore
-└── README.md
-<<<<<<< HEAD
->>>>>>> cd48368 (Primer commit)
-=======
-```
->>>>>>> b46de84 (analizar la calidad de los fits con flags para verificar su credibilidad)
-=======
-
-```text
-.
-├── data/                 # Datos FITS originales y muestras pequeñas
-├── backend/              # API Python (FastAPI)
-├── frontend/             # Interfaz React + TypeScript
-├── notebooks/            # Exploración y preparación de datos
-└── index.ipynb           # Notebook existente del equipo
+```sh
+docker build -t spherex-explorer-api backend
+docker run --rm -p 8000:8000 -e SPHEREX_CORS_ORIGINS=http://localhost:3000 spherex-explorer-api
 ```
 
-## Requisitos
-
-- Node.js 20 o superior
-- Python 3.11 o superior
-
-## Arranque
-
-### API
-
-```powershell
-cd backend
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-La API queda en `http://localhost:8000`; la documentación interactiva en `/docs`.
-
-### Interfaz
-
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-
-## Datos
-
-El FITS de `data/` se conserva como dato local del equipo y no se incluye en Git. Consultad su licencia, procedencia y metadatos antes de redistribuirlo. La interfaz inicial puede trabajar con imágenes de muestra; indicad siempre si una imagen o candidato es simulado.
-
-## Flujo previsto
-
-1. Seleccionar una región del cielo.
-2. Elegir dos épocas y una banda.
-3. Comparar las imágenes y revisar posibles objetos móviles.
-4. Mostrar metadatos y etiquetar hallazgos como candidatos, no como descubrimientos confirmados.
->>>>>>> 60d5e2f (Merge readme arreglado)
+El contenedor ejecuta Uvicorn como usuario sin privilegios y comprueba `/api/v1/estado`.

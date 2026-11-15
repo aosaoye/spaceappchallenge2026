@@ -1,21 +1,23 @@
 """
-Representación, consulta e inspección científica multihilo de los datos astronómicos de SPHEREx.
-Utiliza ThreadPoolExecutor y deduplicación single-flight para paralelizar descargas FITS,
-cálculos WCS espaciales/espectrales (LVF) y renderizado de imágenes PNG sin bloquear la API.
+Representación, consulta e inspección científica de datos astronómicos SPHEREx.
+Deduplica descargas FITS simultáneas y protege las cachés y el renderizado concurrente.
 """
 
 import http.client
+import copy
 import io
+import logging
+import os
 import ssl
 import threading
 import time
 import urllib.error
 from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote, urlsplit
-from urllib.request import urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, HTTPSHandler
 
 import certifi
 import matplotlib
@@ -27,14 +29,21 @@ from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.table import Table
+from astropy.time import Time
 from astropy.utils.data import conf
 from astropy.visualization import AsinhStretch, ImageNormalize
 from astropy.wcs import WCS
 from astroquery.ipac.irsa import Irsa
 
 from dominio import Observacion
+from configuracion import obtener_entero
 
 conf.remote_timeout = 120
+logger = logging.getLogger(__name__)
+
+
+class ErrorIRSA(ConnectionError):
+    """Representa un fallo comunicado por el servicio IRSA."""
 
 # Candado exclusivo para Matplotlib (Agg) cuando múltiples hilos renderizan figuras simultáneamente
 _MATPLOTLIB_LOCK = threading.Lock()
@@ -58,27 +67,32 @@ BANDAS_LVF_DETECTOR: dict[int, dict[str, object]] = {
     6: {"banda": "Band 6 (D6)", "rango_um": "4.42 - 5.00 µm", "resolucion_R": 128},
 }
 
+COLECCIONES_SPHEREX = (
+    "spherex_dr1",
+    "spherex_dr1_deep",
+    "spherex_qr3",
+    "spherex_qr3_deep",
+)
+
 
 class RepositorioIrsa:
     """
     Conecta con IRSA para consultar, descargar, inspeccionar y visualizar
-    productos científicos Multi-Extension FITS (MEF) de SPHEREx usando un
-    pool de hilos (ThreadPoolExecutor) y caché concurrente en memoria.
+    productos científicos Multi-Extension FITS (MEF) de SPHEREx con deduplicación
+    de descargas y cachés concurrentes en memoria.
     """
 
     def __init__(
         self,
-        max_cache_imagenes: int = 48,
-        max_cache_fits: int = 8,
-        max_workers: int = 8,
+        max_cache_imagenes: int | None = None,
+        max_cache_fits: int | None = None,
     ):
-        self._max_cache_imagenes = max_cache_imagenes
-        self._max_cache_fits = max_cache_fits
+        self._max_cache_imagenes = max_cache_imagenes or obtener_entero("SPHEREX_CACHE_PNG", 8)
+        self._max_cache_fits = max_cache_fits or obtener_entero("SPHEREX_CACHE_FITS", 2)
+        self._max_bytes_fits = obtener_entero("SPHEREX_MAX_FITS_BYTES", 536870912)
+        self._max_bytes_cache_fits = obtener_entero("SPHEREX_CACHE_FITS_BYTES", 536870912)
+        self._timeout_descarga = obtener_entero("SPHEREX_TIMEOUT_DESCARGA", 90)
         self._lock = threading.RLock()
-        self._pool = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="spherex_worker",
-        )
         self._vuelos_fits: dict[str, Future[bytes]] = {}
         self._cache_png: OrderedDict[str, bytes] = OrderedDict()
         self._cache_fits_bytes: OrderedDict[str, bytes] = OrderedDict()
@@ -88,8 +102,9 @@ class RepositorioIrsa:
         self._cache_analisis_calidad: OrderedDict[str, dict] = OrderedDict()
         self._cache_busquedas: OrderedDict[str, list[Observacion]] = OrderedDict()
 
-        # Precargar en segundo plano el archivo FITS local para respuesta instantánea (0 ms)
-        self._pool.submit(self._precargar_recursos_locales)
+        # La precarga es local, opcional y se coordina fuera del pool de descargas.
+        if os.getenv("SPHEREX_PRECARGA_LOCAL", "false").lower() in {"1", "true", "si", "sí"}:
+            threading.Thread(target=self._precargar_recursos_locales, daemon=True, name="spherex_precarga").start()
 
     def _precargar_recursos_locales(self) -> None:
         """
@@ -101,15 +116,14 @@ class RepositorioIrsa:
             if ruta is not None and ruta.is_file():
                 contenido = ruta.read_bytes()
                 clave = str(ruta)
-                with self._lock:
-                    self._cache_fits_bytes[clave] = contenido
+                self._guardar_cache_fits(clave, contenido)
                 self.obtener_estructura_fits("local")
                 self.obtener_metadatos_fits("local")
                 self.analizar_imagen_fits("local")
                 self.analizar_calidad_fits("local")
                 self.convertir_fits_a_png("local", modo="flujo")
         except Exception:
-            pass
+            logger.exception("Falló la precarga opcional de recursos FITS locales.")
 
     def buscar_por_coordenadas(
         self,
@@ -118,15 +132,20 @@ class RepositorioIrsa:
         radio: float
     ) -> list[Observacion]:
         """
-        Consulta los productos SPHEREx cercanos a unas coordenadas en las
-        colecciones recomendadas ('spherex_dr1', 'spherex_qr3') y lanza
-        precarga en segundo plano del primer resultado en el pool de hilos.
+        Consulta los productos SPHEREx cercanos a unas coordenadas en las colecciones DR1 y QR3.
+        Devuelve los productos conservando las filas y metadatos temporales publicados por IRSA.
         """
-        clave_busqueda = f"{ascension_recta:.4f}:{declinacion:.4f}:{radio:.1f}"
+        if not np.isfinite([ascension_recta, declinacion, radio]).all():
+            raise ValueError("Las coordenadas y el radio deben ser valores finitos.")
+        if not 0 <= ascension_recta <= 360 or not -90 <= declinacion <= 90:
+            raise ValueError("RA debe estar entre 0 y 360 grados y DEC entre -90 y 90 grados.")
+        if not 0 < radio <= 3600:
+            raise ValueError("El radio debe ser mayor que 0 y no superar 3600 segundos de arco.")
+        clave_busqueda = f"{ascension_recta:.8f}:{declinacion:.8f}:{radio:.4f}"
         with self._lock:
             if clave_busqueda in self._cache_busquedas:
                 self._cache_busquedas.move_to_end(clave_busqueda)
-                return list(self._cache_busquedas[clave_busqueda])
+                return copy.deepcopy(self._cache_busquedas[clave_busqueda])
 
         coordenadas = SkyCoord(
             ra=ascension_recta * u.deg,
@@ -137,14 +156,11 @@ class RepositorioIrsa:
         try:
             resultados = Irsa.query_sia(
                 pos=(coordenadas, radio * u.arcsec),
-                collection=["spherex_dr1", "spherex_qr3"]
+                collection=list(COLECCIONES_SPHEREX)
             )
-        except Exception:
-            radio_reducido = min(float(radio), 5.0)
-            resultados = Irsa.query_sia(
-                pos=(coordenadas, radio_reducido * u.arcsec),
-                collection=["spherex_dr1", "spherex_qr3"]
-            )
+        except Exception as error:
+            logger.exception("Falló la consulta SIA a IRSA.")
+            raise ErrorIRSA("No se pudo consultar IRSA.") from error
 
         observaciones: list[Observacion] = []
 
@@ -161,29 +177,66 @@ class RepositorioIrsa:
                 tipo_producto=str(fila["dataproduct_subtype"]),
                 url_acceso=url_acceso,
                 tamano_estimado=int(tamano) if tamano is not None else None,
-                url_imagen_png=f"/api/v1/observaciones/imagen?fits_url={quote(url_acceso, safe='')}"
+                url_imagen_png=f"/api/v1/observaciones/imagen?fits_url={quote(url_acceso, safe='')}",
+                fecha_observacion=self._fecha_fila(fila),
+                fecha_fin_observacion=self._fecha_fila(fila, final=True),
+                mjd_inicio=self._mjd_fila(fila, final=False),
+                mjd_fin=self._mjd_fila(fila, final=True),
             )
 
             observaciones.append(observacion)
 
         with self._lock:
-            self._cache_busquedas[clave_busqueda] = observaciones
+            self._cache_busquedas[clave_busqueda] = copy.deepcopy(observaciones)
             while len(self._cache_busquedas) > 64:
                 self._cache_busquedas.popitem(last=False)
 
-        # Precargar en paralelo el primer FITS encontrado sin bloquear la respuesta HTTP
-        if observaciones:
-            primera_url = observaciones[0].url_acceso
-            self._pool.submit(self._precalentar_fits_url, primera_url)
-
         return observaciones
+
+    def _fecha_fila(self, fila, final: bool = False) -> str | None:
+        """Extrae una fecha explícita de los metadatos de IRSA.
+        Devuelve la fecha ISO disponible o None cuando la fila no aporta una fecha verificable.
+        """
+        columnas_fecha = ("date_end", "DATE-END") if final else ("date_obs", "date-obs", "DATE-OBS", "date_beg", "DATE-BEG")
+        columnas_mjd = ("mjd_end", "MJD-END", "t_max") if final else ("mjd_beg", "MJD-BEG", "t_min", "mjd_obs", "MJD-OBS")
+        for nombre in (*columnas_fecha, *columnas_mjd):
+            try:
+                valor = self._obtener_valor(fila, nombre)
+            except (KeyError, TypeError, IndexError):
+                continue
+            if valor is None:
+                continue
+            es_mjd = nombre.lower().replace("-", "_").startswith("mjd") or nombre.lower() in {"t_min", "t_max"}
+            if es_mjd:
+                try:
+                    return str(Time(float(valor), format="mjd", scale="utc").isot)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            texto = str(valor).strip()
+            if texto and texto.lower() not in {"nan", "none", "masked"}:
+                return texto
+        return None
+
+    def _mjd_fila(self, fila, final: bool) -> float | None:
+        """Extrae el límite temporal MJD de una fila de IRSA.
+        Devuelve el valor MJD finito original o None cuando IRSA no proporciona ese límite.
+        """
+        nombres = ("mjd_end", "MJD-END", "t_max") if final else ("mjd_beg", "MJD-BEG", "t_min", "mjd_obs", "MJD-OBS")
+        for nombre in nombres:
+            try:
+                valor = self._obtener_valor(fila, nombre)
+                if valor is not None and np.isfinite(float(valor)):
+                    return float(valor)
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+        return None
 
     def _precalentar_fits_url(self, url_acceso: str) -> None:
         try:
             self.obtener_estructura_fits(url_acceso)
             self.obtener_metadatos_fits(url_acceso)
         except Exception:
-            pass
+            logger.exception("Falló el precalentamiento opcional de un FITS.")
 
     def _obtener_bytes_fits_con_deduplicacion(self, url_limpia: str) -> bytes:
         """
@@ -201,26 +254,41 @@ class RepositorioIrsa:
                 return self._cache_fits_bytes[clave_efectiva]
 
             vuelo_existente = self._vuelos_fits.get(clave_efectiva)
-            if vuelo_existente is None:
-                vuelo_existente = self._pool.submit(
-                    self._descargar_bytes_fits_worker,
-                    url_limpia,
-                    ruta_local,
-                )
+            propietario = vuelo_existente is None
+            if propietario:
+                vuelo_existente = Future()
                 self._vuelos_fits[clave_efectiva] = vuelo_existente
 
-        try:
-            contenido = vuelo_existente.result(timeout=125)
-        finally:
-            with self._lock:
-                self._vuelos_fits.pop(clave_efectiva, None)
+        if propietario:
+            try:
+                contenido = self._descargar_bytes_fits_worker(url_limpia, ruta_local)
+                vuelo_existente.set_result(contenido)
+            except BaseException as error:
+                vuelo_existente.set_exception(error)
+                raise
+            finally:
+                with self._lock:
+                    if self._vuelos_fits.get(clave_efectiva) is vuelo_existente:
+                        self._vuelos_fits.pop(clave_efectiva, None)
+        else:
+            contenido = vuelo_existente.result(timeout=self._timeout_descarga * 2 + 10)
 
-        with self._lock:
-            self._cache_fits_bytes[clave_efectiva] = contenido
-            if len(self._cache_fits_bytes) > self._max_cache_fits:
-                self._cache_fits_bytes.popitem(last=False)
+        self._guardar_cache_fits(clave_efectiva, contenido)
 
         return contenido
+
+    def _guardar_cache_fits(self, clave: str, contenido: bytes) -> None:
+        """Guarda bytes FITS respetando los límites de memoria configurados.
+        Devuelve None y omite la caché cuando el archivo excede el presupuesto permitido.
+        """
+        if len(contenido) > min(self._max_bytes_fits, self._max_bytes_cache_fits):
+            return
+        with self._lock:
+            self._cache_fits_bytes[clave] = contenido
+            self._cache_fits_bytes.move_to_end(clave)
+            while (len(self._cache_fits_bytes) > self._max_cache_fits or
+                   sum(map(len, self._cache_fits_bytes.values())) > self._max_bytes_cache_fits):
+                self._cache_fits_bytes.popitem(last=False)
 
     def _descargar_bytes_fits_worker(
         self,
@@ -228,12 +296,18 @@ class RepositorioIrsa:
         ruta_local: Path | None,
     ) -> bytes:
         if ruta_local is not None and ruta_local.is_file():
-            return ruta_local.read_bytes()
+            contenido_local = ruta_local.read_bytes()
+            if len(contenido_local) > self._max_bytes_fits:
+                raise ValueError("El FITS local supera el tamaño máximo permitido.")
+            return contenido_local
 
         partes_url = urlsplit(url_limpia)
         if (
             partes_url.scheme != "https"
             or partes_url.hostname != "irsa.ipac.caltech.edu"
+            or partes_url.username is not None
+            or partes_url.password is not None
+            or partes_url.port not in (None, 443)
         ):
             raise ValueError(
                 "La URL debe pertenecer al servicio HTTPS de IRSA (irsa.ipac.caltech.edu)."
@@ -243,24 +317,57 @@ class RepositorioIrsa:
             cafile=certifi.where()
         )
 
-        max_reintentos = 3
+        class RedireccionSegura(HTTPRedirectHandler):
+            """Limita las redirecciones al dominio HTTPS autorizado."""
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                """Valida cada destino de redirección.
+                Devuelve una nueva solicitud solo si conserva HTTPS y el host autorizado.
+                """
+                partes = urlsplit(newurl)
+                if (partes.scheme != "https" or partes.hostname != "irsa.ipac.caltech.edu"
+                        or partes.port not in (None, 443) or partes.username is not None
+                        or partes.password is not None):
+                    raise ValueError("IRSA redirigió a un destino no autorizado.")
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+        max_reintentos = 2
+        opener = build_opener(HTTPSHandler(context=contexto_ssl), RedireccionSegura())
         for intento in range(max_reintentos):
             try:
-                with urlopen(
-                    url_limpia,
-                    timeout=90,
-                    context=contexto_ssl
-                ) as respuesta:
-                    return respuesta.read()
+                request = Request(url_limpia, headers={"User-Agent": "SPHEREx-Explorer/1.0"})
+                with opener.open(request, timeout=self._timeout_descarga) as respuesta:
+                    largo = respuesta.headers.get("Content-Length")
+                    if largo and int(largo) > self._max_bytes_fits:
+                        raise ValueError("El FITS supera el tamaño máximo permitido.")
+                    contenido = respuesta.read(self._max_bytes_fits + 1)
+                    if len(contenido) > self._max_bytes_fits:
+                        raise ValueError("El FITS supera el tamaño máximo permitido.")
+                    if largo and len(contenido) != int(largo):
+                        raise http.client.IncompleteRead(contenido, int(largo) - len(contenido))
+                    if not contenido.startswith(b"SIMPLE  "):
+                        raise ValueError("La respuesta remota no parece un archivo FITS válido.")
+                    return contenido
+            except ValueError:
+                raise
+            except urllib.error.HTTPError as error:
+                if error.code == 404:
+                    raise FileNotFoundError("IRSA no encontró el archivo FITS solicitado.") from error
+                if 400 <= error.code < 500:
+                    raise ErrorIRSA(f"IRSA rechazó la descarga FITS con HTTP {error.code}.") from error
+                if intento == max_reintentos - 1:
+                    raise ErrorIRSA(f"IRSA respondió HTTP {error.code} al descargar el FITS.") from error
+                logger.warning("IRSA devolvió HTTP %s al descargar un FITS (intento %s/%s).", error.code, intento + 1, max_reintentos)
+                time.sleep(0.5 * (intento + 1))
             except (
                 TimeoutError,
-                urllib.error.HTTPError,
                 urllib.error.URLError,
                 http.client.IncompleteRead,
             ):
                 if intento == max_reintentos - 1:
-                    raise
-                time.sleep(1.5 * (intento + 1))
+                    logger.exception("Se agotaron los intentos de descarga FITS de IRSA.")
+                    raise ErrorIRSA("No se pudo descargar el archivo FITS desde IRSA.")
+                logger.warning("Error temporal al descargar FITS de IRSA (intento %s/%s).", intento + 1, max_reintentos)
+                time.sleep(0.5 * (intento + 1))
 
         raise RuntimeError("No se pudo descargar el contenido del archivo FITS.")
 
@@ -280,7 +387,7 @@ class RepositorioIrsa:
         with self._lock:
             if url_limpia in self._cache_estructura:
                 self._cache_estructura.move_to_end(url_limpia)
-                return self._cache_estructura[url_limpia]
+                return copy.deepcopy(self._cache_estructura[url_limpia])
 
         archivo = self.descargar_fits(url_limpia)
         try:
@@ -313,7 +420,7 @@ class RepositorioIrsa:
                 extensiones.append(informacion)
 
             with self._lock:
-                self._cache_estructura[url_limpia] = extensiones
+                self._cache_estructura[url_limpia] = copy.deepcopy(extensiones)
                 if len(self._cache_estructura) > 32:
                     self._cache_estructura.popitem(last=False)
 
@@ -323,14 +430,14 @@ class RepositorioIrsa:
 
     def obtener_metadatos_fits(self, url_acceso: str) -> dict:
         """
-        Extrae en paralelo los metadatos científicos, WCS espacial y WCS espectral (LVF)
+        Extrae metadatos científicos, WCS espacial y WCS espectral (LVF)
         de un archivo FITS de SPHEREx, guardando el resultado en caché.
         """
         url_limpia = url_acceso.strip().strip('"').strip("'")
         with self._lock:
             if url_limpia in self._cache_metadatos:
                 self._cache_metadatos.move_to_end(url_limpia)
-                return self._cache_metadatos[url_limpia]
+                return copy.deepcopy(self._cache_metadatos[url_limpia])
 
         archivo = self.descargar_fits(url_limpia)
         try:
@@ -352,6 +459,13 @@ class RepositorioIrsa:
                 "DATE",
                 "DATE-OBS",
                 "MJD-OBS",
+                "DATE-BEG",
+                "MJD-BEG",
+                "DATE-AVG",
+                "MJD-AVG",
+                "DATE-END",
+                "MJD-END",
+                "TIMESYS",
                 "OBSID",
                 "OBS_ID",
                 "DETECTOR",
@@ -373,6 +487,18 @@ class RepositorioIrsa:
                 for clave in campos_generales
                 if clave in cabecera_imagen
             }
+            fecha_observacion = (
+                cabecera_imagen.get("DATE-OBS")
+                or cabecera_principal.get("DATE-OBS")
+            )
+            if fecha_observacion is None:
+                mjd_observacion = cabecera_imagen.get("MJD-OBS", cabecera_principal.get("MJD-OBS"))
+                if mjd_observacion is not None:
+                    try:
+                        fecha_observacion = Time(float(mjd_observacion), format="mjd", scale="utc").isot
+                    except (TypeError, ValueError, OverflowError):
+                        logger.warning("MJD-OBS no contiene un valor temporal válido.")
+            fecha_observacion = str(fecha_observacion) if fecha_observacion is not None else None
 
             wcs_alternativos = {
                 clave: self._serializar_valor_fits(cabecera_imagen[clave])
@@ -433,7 +559,7 @@ class RepositorioIrsa:
                     "pixel_central_y": round(y_central, 2),
                 }
             except Exception:
-                pass
+                logger.warning("No se pudo derivar el WCS espacial de la cabecera FITS.", exc_info=True)
 
             # 8b y 8c. WCS Espectral ('W' -> tabla WCS-WAVE) con sip = None
             wcs_espectral_info: dict[str, object] = {}
@@ -471,7 +597,7 @@ class RepositorioIrsa:
                         else None,
                     }
                 except Exception:
-                    pass
+                    logger.warning("No se pudo derivar el WCS espectral WCS-WAVE.", exc_info=True)
 
             conteo_flags_l2 = {
                 clave: self._serializar_valor_fits(cabecera_imagen[clave])
@@ -529,7 +655,7 @@ class RepositorioIrsa:
                             float(np.nanmedian(epsf_table["CWAVE"])), 4
                         )
                 except Exception:
-                    pass
+                    logger.warning("No se pudo resumir la tabla EPSF.", exc_info=True)
                 resumen_extensiones["EPSF"] = epsf_info
 
             if "WCS-WAVE" in archivo:
@@ -546,9 +672,10 @@ class RepositorioIrsa:
                         "dimensiones_values": list(valores_arr.shape),
                     }
                 except Exception:
-                    pass
+                    logger.warning("No se pudo resumir la tabla WCS-WAVE.", exc_info=True)
 
             resultado = {
+                "fecha_observacion": fecha_observacion,
                 "cabecera_principal": metadatos_principales,
                 "cabecera_imagen": metadatos_imagen,
                 "banda_detector": info_detector,
@@ -563,7 +690,7 @@ class RepositorioIrsa:
             }
 
             with self._lock:
-                self._cache_metadatos[url_limpia] = resultado
+                self._cache_metadatos[url_limpia] = copy.deepcopy(resultado)
                 if len(self._cache_metadatos) > 32:
                     self._cache_metadatos.popitem(last=False)
 
@@ -580,7 +707,7 @@ class RepositorioIrsa:
         with self._lock:
             if url_limpia in self._cache_analisis_imagen:
                 self._cache_analisis_imagen.move_to_end(url_limpia)
-                return self._cache_analisis_imagen[url_limpia]
+                return copy.deepcopy(self._cache_analisis_imagen[url_limpia])
 
         archivo = self.descargar_fits(url_limpia)
         try:
@@ -625,7 +752,7 @@ class RepositorioIrsa:
             }
 
             with self._lock:
-                self._cache_analisis_imagen[url_limpia] = resultado
+                self._cache_analisis_imagen[url_limpia] = copy.deepcopy(resultado)
                 if len(self._cache_analisis_imagen) > 32:
                     self._cache_analisis_imagen.popitem(last=False)
 
@@ -642,7 +769,7 @@ class RepositorioIrsa:
         with self._lock:
             if url_limpia in self._cache_analisis_calidad:
                 self._cache_analisis_calidad.move_to_end(url_limpia)
-                return self._cache_analisis_calidad[url_limpia]
+                return copy.deepcopy(self._cache_analisis_calidad[url_limpia])
 
         archivo = self.descargar_fits(url_limpia)
         try:
@@ -735,7 +862,7 @@ class RepositorioIrsa:
             }
 
             with self._lock:
-                self._cache_analisis_calidad[url_limpia] = resultado
+                self._cache_analisis_calidad[url_limpia] = copy.deepcopy(resultado)
                 if len(self._cache_analisis_calidad) > 32:
                     self._cache_analisis_calidad.popitem(last=False)
 
@@ -748,13 +875,15 @@ class RepositorioIrsa:
         Lee un archivo FITS de SPHEREx y lo exporta rápidamente como PNG usando
         muestreo optimizado y bloqueo seguro de Matplotlib entre hilos.
         """
+        if modo not in {"flujo", "longitud_onda"}:
+            raise ValueError("El modo debe ser 'flujo' o 'longitud_onda'.")
         url_limpia = url_fits.strip().strip('"').strip("'")
         clave_cache = f"{modo}:{url_limpia}"
 
         with self._lock:
             if clave_cache in self._cache_png:
                 self._cache_png.move_to_end(clave_cache)
-                return self._cache_png[clave_cache]
+                return bytes(self._cache_png[clave_cache])
 
         hdul = self.descargar_fits(url_limpia)
         try:
@@ -763,19 +892,32 @@ class RepositorioIrsa:
             detector = header.get("DETECTOR", "Unknown")
             obsid = header.get("OBSID", header.get("OBS_ID", "Unknown"))
 
-            if modo == "longitud_onda" and "WCS-WAVE" in hdul:
-                spectral_wcs = WCS(header=header, fobj=hdul, key="W")
-                spectral_wcs.sip = None
-                alto, ancho = ext_imagen.data.shape
-                paso = 8
-                y_idx, x_idx = np.mgrid[0:alto:paso, 0:ancho:paso]
-                wavelength, _ = spectral_wcs.pixel_to_world(x_idx, y_idx)
-                matriz_visual = np.asarray(wavelength.value, dtype=np.float32)
-                etiqueta_cb = f"Wavelength [{wavelength.unit}]"
-                titulo = f"SPHEREx Wavelength Map | {obsid} | Detector {detector}"
-                norm = None
-                extent = [0, ancho, 0, alto]
+            if modo == "longitud_onda":
+                if "WCS-WAVE" not in hdul:
+                    raise ValueError("El FITS no contiene la extensión WCS-WAVE necesaria para el modo longitud_onda.")
+                if ext_imagen.data is None or np.ndim(ext_imagen.data) != 2:
+                    raise ValueError("La extensión IMAGE debe contener una matriz bidimensional.")
+                try:
+                    spectral_wcs = WCS(header=header, fobj=hdul, key="W")
+                    spectral_wcs.sip = None
+                    alto, ancho = ext_imagen.data.shape
+                    paso = 8
+                    y_idx, x_idx = np.mgrid[0:alto:paso, 0:ancho:paso]
+                    wavelength, _ = spectral_wcs.pixel_to_world(x_idx, y_idx)
+                    matriz_visual = np.asarray(wavelength.value, dtype=np.float32)
+                    if not np.isfinite(matriz_visual).any():
+                        raise ValueError("WCS-WAVE no produjo longitudes de onda válidas.")
+                    etiqueta_cb = f"Wavelength [{wavelength.unit}]"
+                    titulo = f"SPHEREx Wavelength Map | {obsid} | Detector {detector}"
+                    norm = None
+                    extent = [0, ancho, 0, alto]
+                except ValueError:
+                    raise
+                except Exception as error:
+                    raise ValueError("La extensión WCS-WAVE no permite construir un mapa de longitud de onda.") from error
             else:
+                if ext_imagen.data is None or np.ndim(ext_imagen.data) != 2:
+                    raise ValueError("La extensión IMAGE debe contener una matriz bidimensional.")
                 image = np.array(ext_imagen.data, dtype=np.float32)
                 # Submuestreo 2x para cálculo ultrarrápido de percentiles en matrices 2040x2040
                 muestra = image[::2, ::2]
@@ -823,35 +965,45 @@ class RepositorioIrsa:
             hdul.close()
 
         with self._lock:
-            self._cache_png[clave_cache] = png_bytes
+            self._cache_png[clave_cache] = bytes(png_bytes)
             if len(self._cache_png) > self._max_cache_imagenes:
                 self._cache_png.popitem(last=False)
 
         return png_bytes
 
     def _resolver_fits_local(self, url_o_id: str) -> Path | None:
-        base_proyecto = Path(__file__).resolve().parents[3]
-        candidato = (
-            base_proyecto
-            / "data"
-            / "level2_2025W18_1B_0074_2D1_spx_l2b-v27-2026-196.fits"
+        """Resuelve el FITS local opcional del proyecto.
+        Devuelve una ruta existente configurada o None cuando no hay coincidencia local.
+        """
+        configurada = os.getenv("SPHEREX_FITS_LOCAL")
+        base_proyecto = Path(__file__).resolve().parent.parent
+        candidato = Path(configurada).expanduser() if configurada else (
+            base_proyecto / "data" / "level2_2025W18_1B_0074_2D1_spx_l2b-v27-2026-196.fits"
         )
         if (
             url_o_id in ("local", "2025W18_1B_0074_2")
             or "2025W18_1B_0074_2D1" in url_o_id
         ):
             if candidato.is_file():
-                return candidato
+                return candidato.resolve()
         return None
 
     def _serializar_valor_fits(self, valor: object) -> object:
+        if isinstance(valor, np.ndarray):
+            return [self._serializar_valor_fits(elemento) for elemento in valor.tolist()]
+        if isinstance(valor, (list, tuple)):
+            return [self._serializar_valor_fits(elemento) for elemento in valor]
         if isinstance(valor, (np.integer,)):
             return int(valor)
+        if isinstance(valor, np.bool_):
+            return bool(valor)
         if isinstance(valor, (np.floating,)):
             val_float = float(valor)
             return val_float if np.isfinite(val_float) else None
         if isinstance(valor, (bool, int, float, str)) or valor is None:
             return valor
+        if isinstance(valor, bytes):
+            return valor.decode("utf-8", errors="replace")
         return str(valor)
 
     def _obtener_valor(self, fila, columna):

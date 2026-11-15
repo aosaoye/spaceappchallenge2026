@@ -1,8 +1,16 @@
+import logging
+import os
+
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from aplicacion import BuscarObservaciones, ConvertirFitsAPng
-from infraestructura import RepositorioIrsa
+from configuracion import obtener_origenes_cors
+from infraestructura import ErrorIRSA, RepositorioIrsa
+
+logger = logging.getLogger(__name__)
+nivel_logging = getattr(logging, os.getenv("SPHEREX_LOG_LEVEL", "INFO").upper(), logging.INFO)
+logging.basicConfig(level=nivel_logging if isinstance(nivel_logging, int) else logging.INFO)
 
 app = FastAPI(
     title="SPHEREx Explorer",
@@ -12,7 +20,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_origins=obtener_origenes_cors(),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -61,10 +69,7 @@ def obtener_observaciones(
         }
 
     except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error al consultar IRSA: {str(error)}"
-        )
+        raise _http_error(error, "consultar IRSA") from error
 
 
 @app.get("/api/v1/observaciones/estructura-fits")
@@ -94,10 +99,7 @@ def obtener_estructura_fits(
             detail=str(error)
         )
     except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error al inspeccionar el archivo FITS: {str(error)}"
-        )
+        raise _http_error(error, "inspeccionar el FITS") from error
 
 
 @app.get("/api/v1/observaciones/metadatos-fits")
@@ -126,10 +128,7 @@ def obtener_metadatos_fits(
             detail=str(error)
         )
     except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error al obtener los metadatos FITS: {str(error)}"
-        )
+        raise _http_error(error, "obtener metadatos FITS") from error
 
 
 @app.get("/api/v1/observaciones/analisis-fits")
@@ -157,10 +156,7 @@ def analizar_imagen_fits(
             detail=str(error)
         )
     except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error al analizar la imagen FITS: {str(error)}"
-        )
+        raise _http_error(error, "analizar la imagen FITS") from error
 
 
 @app.get("/api/v1/observaciones/analisis-calidad-fits")
@@ -188,10 +184,7 @@ def analizar_calidad_fits(
             detail=str(error)
         )
     except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error al analizar la calidad del FITS: {str(error)}"
-        )
+        raise _http_error(error, "analizar la calidad del FITS") from error
 
 
 @app.get("/api/v1/observaciones/imagen")
@@ -216,7 +209,22 @@ def obtener_imagen_observacion(
             detail=str(error)
         )
     except Exception as error:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error al convertir el FITS a PNG: {str(error)}"
-        )
+        raise _http_error(error, "convertir el FITS a PNG") from error
+
+
+def _http_error(error: Exception, operacion: str) -> HTTPException:
+    """Traduce errores de infraestructura a códigos HTTP adecuados.
+    Devuelve una excepción HTTP con un estado que distingue validación, ausencia, servicio externo y fallo interno.
+    """
+    if isinstance(error, HTTPException):
+        return error
+    if isinstance(error, ValueError):
+        return HTTPException(status_code=400, detail=str(error))
+    if isinstance(error, FileNotFoundError):
+        return HTTPException(status_code=404, detail="El recurso solicitado no existe.")
+    if isinstance(error, TimeoutError):
+        return HTTPException(status_code=504, detail=f"Tiempo agotado al {operacion}.")
+    if isinstance(error, ErrorIRSA):
+        return HTTPException(status_code=502, detail=str(error))
+    logger.exception("Error interno al %s.", operacion, exc_info=error)
+    return HTTPException(status_code=500, detail=f"Error interno al {operacion}.")
