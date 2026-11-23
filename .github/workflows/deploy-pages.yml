@@ -30,6 +30,11 @@ jobs:
 
       - name: Instalar pnpm
         uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+
+      - name: Configurar GitHub Pages
+        uses: actions/configure-pages@v5
 
       - name: Configurar Node.js
         uses: actions/setup-node@v4
