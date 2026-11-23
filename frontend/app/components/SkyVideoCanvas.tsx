@@ -1,14 +1,17 @@
 "use client";
 
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { AlertCircle, Loader2, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import * as THREE from "three";
 import {
-  CHALLENGE_TARGETS,
   ChallengeTarget,
+  DEFAULT_FOV_ARCSEC,
   EpochFrame,
+  FitsCutoutPayload,
+  MAX_FOV_ARCSEC,
+  MIN_FOV_ARCSEC,
   formatDecDMS,
   formatRAHMS,
+  getFitsCutoutUrl,
 } from "../astronomy";
 import { SelectedSkySource } from "./SpherexSpectrumPanel";
 
@@ -35,62 +38,140 @@ interface SkyVideoCanvasProps {
   onSelectSkySource?: (source: SelectedSkySource) => void;
   onZoomChange: (nextFovArcsec: number) => void;
   fullViewport?: boolean;
-  view360?: boolean;
 }
 
-interface BackgroundStar {
-  id: string;
-  dRaArcsec: number;
-  dDecArcsec: number;
-  baseFlux: number;
-  spectralSlope: number;
+interface DecodedFitsCutout {
+  identificador: string;
+  detector: number | string;
+  unidad: string;
+  ancho: number;
+  alto: number;
+  vmin: number;
+  vmax: number;
+  mediana: number;
+  ruidoMad: number;
+  raCentro: number;
+  decCentro: number;
+  fovArcsec: number;
+  pixscaleArcsec: number;
+  coberturaWcs: boolean;
+  pixelesValidos: number;
+  flux: Float32Array;
 }
 
-const GRID_W = 380;
-const GRID_H = 260;
+const MAX_CLIENT_CUTOUT_CACHE = 64;
+const PREFETCH_CONCURRENCY = 2;
+const OFFSCREEN_HEIGHT = 280;
+const cutoutMemoryCache = new Map<string, DecodedFitsCutout>();
+const cutoutInFlight = new Map<string, Promise<DecodedFitsCutout>>();
 
-function mulberry32(seed: number) {
-  let a = seed >>> 0;
-  return function next() {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function generateBackgroundStars(
-  raDeg: number,
-  decDeg: number
-): BackgroundStar[] {
-  const seed =
-    (Math.round(raDeg * 1000) * 73856093) ^
-    (Math.round((decDeg + 90) * 1000) * 19349663);
-  const rand = mulberry32(seed);
-  const stars: BackgroundStar[] = [];
-
-  for (let i = 0; i < 140; i++) {
-    const dRaArcsec = (rand() - 0.5) * 420;
-    const dDecArcsec = (rand() - 0.5) * 320;
-    if (Math.hypot(dRaArcsec, dDecArcsec) < 4.5) continue;
-    const u = rand();
-    const baseFlux = 0.08 + Math.pow(u, 3.2) * 3.8;
-    const spectralSlope = (rand() - 0.5) * 0.45;
-    stars.push({
-      id: `SPX-STAR-${i + 1}`,
-      dRaArcsec,
-      dDecArcsec,
-      baseFlux,
-      spectralSlope,
-    });
+function decodeFloat32Base64(b64: string): Float32Array {
+  const binary = atob(b64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
   }
-  return stars;
+  return new Float32Array(
+    bytes.buffer,
+    bytes.byteOffset,
+    Math.floor(bytes.byteLength / 4)
+  );
 }
 
-function getBandIndex(bandLabel: string): number {
-  const match = bandLabel.match(/D(\d)/i);
-  return match ? Number.parseInt(match[1], 10) : 2;
+function pickFetchFovArcsec(fovArcsec: number): number {
+  if (fovArcsec <= 240) return 480;
+  if (fovArcsec <= 600) return 1200;
+  if (fovArcsec <= 1200) return 2400;
+  if (fovArcsec <= 2400) return 4800;
+  return 7200;
+}
+
+function buildCutoutKey(
+  fitsUrl: string,
+  raDeg: number,
+  decDeg: number,
+  fetchFovArcsec: number
+): string {
+  return `${fitsUrl}|${raDeg.toFixed(5)}|${decDeg.toFixed(5)}|${fetchFovArcsec}`;
+}
+
+function setBoundedCacheEntry(key: string, value: DecodedFitsCutout) {
+  if (cutoutMemoryCache.has(key)) {
+    cutoutMemoryCache.delete(key);
+  }
+  cutoutMemoryCache.set(key, value);
+  if (cutoutMemoryCache.size > MAX_CLIENT_CUTOUT_CACHE) {
+    const oldest = cutoutMemoryCache.keys().next().value;
+    if (oldest !== undefined) {
+      cutoutMemoryCache.delete(oldest);
+    }
+  }
+}
+
+async function fetchDecodedFitsCutout(
+  fitsUrl: string,
+  raDeg: number,
+  decDeg: number,
+  fetchFovArcsec: number
+): Promise<DecodedFitsCutout> {
+  const key = buildCutoutKey(fitsUrl, raDeg, decDeg, fetchFovArcsec);
+  const cached = cutoutMemoryCache.get(key);
+  if (cached) {
+    cutoutMemoryCache.delete(key);
+    cutoutMemoryCache.set(key, cached);
+    return cached;
+  }
+
+  const existing = cutoutInFlight.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const promise = (async () => {
+    const url = getFitsCutoutUrl({
+      fitsUrl,
+      raDeg,
+      decDeg,
+      fovArcsec: fetchFovArcsec,
+      tamanoPx: 280,
+    });
+    const res = await fetch(url, { cache: "no-store" });
+    const raw = (await res.json()) as FitsCutoutPayload & { detail?: string };
+    if (!res.ok) {
+      throw new Error(
+        raw?.detail || `Error HTTP ${res.status} al leer FITS real.`
+      );
+    }
+
+    const decoded: DecodedFitsCutout = {
+      identificador: raw.identificador,
+      detector: raw.detector,
+      unidad: raw.unidad || "MJy/sr",
+      ancho: raw.ancho,
+      alto: raw.alto,
+      vmin: raw.vmin,
+      vmax: raw.vmax,
+      mediana: raw.mediana,
+      ruidoMad: raw.ruido_mad,
+      raCentro: raw.ra_centro,
+      decCentro: raw.dec_centro,
+      fovArcsec: raw.fov_arcsec,
+      pixscaleArcsec: raw.pixscale_arcsec,
+      coberturaWcs: raw.cobertura_wcs,
+      pixelesValidos: raw.pixeles_validos,
+      flux: decodeFloat32Base64(raw.datos_f32_b64),
+    };
+    setBoundedCacheEntry(key, decoded);
+    return decoded;
+  })();
+
+  cutoutInFlight.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    cutoutInFlight.delete(key);
+  }
 }
 
 export function computeTargetFluxMultiplier(
@@ -106,7 +187,6 @@ export function computeTargetFluxMultiplier(
     return 1;
   }
 
-  // Fase progresiva por fotograma para garantizar variación fotométrica nítida entre épocas
   const phase = frame.index * 0.85 + frame.yearsFromRef * 0.65;
 
   if (target.id === "rw-aurigae") {
@@ -126,186 +206,87 @@ export function computeTargetOffsetArcsec(
   frame: EpochFrame | undefined,
   midYears: number
 ): { dRaArcsec: number; dDecArcsec: number } {
-  if (!frame) return { dRaArcsec: 0, dDecArcsec: 0 };
+  if (!frame || !target) return { dRaArcsec: 0, dDecArcsec: 0 };
   const dtYears = frame.yearsFromRef - midYears;
-  if (!target) {
-    return {
-      dRaArcsec: -4.2 * dtYears,
-      dDecArcsec: 2.5 * dtYears,
-    };
-  }
   return {
     dRaArcsec: (target.pmRaMasYr * dtYears) / 1000,
     dDecArcsec: (target.pmDecMasYr * dtYears) / 1000,
   };
 }
 
-function addGaussianSource(
-  buffer: Float32Array,
-  cx: number,
-  cy: number,
-  sigmaPx: number,
-  amplitude: number
-) {
-  const radius = Math.ceil(sigmaPx * 4.5);
-  const xMin = Math.max(0, Math.floor(cx - radius));
-  const xMax = Math.min(GRID_W - 1, Math.ceil(cx + radius));
-  const yMin = Math.max(0, Math.floor(cy - radius));
-  const yMax = Math.min(GRID_H - 1, Math.ceil(cy + radius));
-  const invTwoSigmaSq = 1 / (2 * sigmaPx * sigmaPx);
+function sampleCutoutBilinear(
+  cutout: DecodedFitsCutout,
+  dRaArcsec: number,
+  dDecArcsec: number
+): number {
+  const { ancho, alto, flux, pixscaleArcsec, coberturaWcs, fovArcsec } = cutout;
+  const scaleFactor = coberturaWcs
+    ? 1.0
+    : fovArcsec / Math.max(DEFAULT_FOV_ARCSEC, 1);
 
-  for (let y = yMin; y <= yMax; y++) {
-    const dy = y - cy;
-    const rowOffset = y * GRID_W;
-    for (let x = xMin; x <= xMax; x++) {
-      const dx = x - cx;
-      const r2 = dx * dx + dy * dy;
-      buffer[rowOffset + x] += amplitude * Math.exp(-r2 * invTwoSigmaSq);
-    }
-  }
-}
+  const col = (ancho - 1) * 0.5 - (dRaArcsec * scaleFactor) / pixscaleArcsec;
+  const row = (alto - 1) * 0.5 - (dDecArcsec * scaleFactor) / pixscaleArcsec;
 
-function renderEpochFluxBuffer(params: {
-  frame: EpochFrame;
-  midYears: number;
-  stars: BackgroundStar[];
-  target: ChallengeTarget | null;
-  panRaArcsec: number;
-  panDecArcsec: number;
-  fovArcsec: number;
-  stackByDetector: boolean;
-  showHistoricalCatalogOverlay: boolean;
-}): Float32Array {
-  const {
-    frame,
-    midYears,
-    stars,
-    target,
-    panRaArcsec,
-    panDecArcsec,
-    fovArcsec,
-    stackByDetector,
-    showHistoricalCatalogOverlay,
-  } = params;
-
-  const buffer = new Float32Array(GRID_W * GRID_H);
-  const pxPerArcsec = GRID_H / fovArcsec;
-  const psfSharpness = stackByDetector ? 0.84 : 1.0;
-  const psfSigmaPx =
-    Math.max(0.95, Math.min(4.2, 1.35 * pxPerArcsec)) * psfSharpness;
-  const bandIdx = getBandIndex(frame.observacion.banda_espectral);
-
-  // Al apilar por detector (Coadd), el ruido de lectura disminuye por 1/√N
-  const noiseRand = mulberry32(1013904223 + frame.index * 9176);
-  const zodiBase = 0.04 + bandIdx * 0.006;
-  const noiseScale = stackByDetector ? 0.009 : 0.028;
-
-  for (let y = 0; y < GRID_H; y++) {
-    const grad = (y / GRID_H) * 0.015;
-    const rowOffset = y * GRID_W;
-    for (let x = 0; x < GRID_W; x++) {
-      const n = (noiseRand() + noiseRand() - 1) * noiseScale;
-      buffer[rowOffset + x] = zodiBase + grad + n;
-    }
+  if (col < -0.5 || col > ancho - 0.5 || row < -0.5 || row > alto - 0.5) {
+    return Number.NaN;
   }
 
-  const skyToGrid = (dRaArcsec: number, dDecArcsec: number) => ({
-    gx: GRID_W / 2 - (dRaArcsec - panRaArcsec) * pxPerArcsec,
-    gy: GRID_H / 2 - (dDecArcsec - panDecArcsec) * pxPerArcsec,
-  });
+  const cx = Math.max(0, Math.min(ancho - 1, col));
+  const cy = Math.max(0, Math.min(alto - 1, row));
+  const x0 = Math.floor(cx);
+  const y0 = Math.floor(cy);
+  const x1 = Math.min(ancho - 1, x0 + 1);
+  const y1 = Math.min(alto - 1, y0 + 1);
+  const fx = cx - x0;
+  const fy = cy - y0;
 
-  // Render static background field stars
-  const snrBoost = stackByDetector ? 1.25 : 1.0;
-  for (const star of stars) {
-    const { gx, gy } = skyToGrid(star.dRaArcsec, star.dDecArcsec);
-    if (gx < -12 || gx > GRID_W + 12 || gy < -12 || gy > GRID_H + 12) continue;
-    const bandMod = 1 + star.spectralSlope * ((bandIdx - 3) / 3);
-    const amp = Math.max(0.04, star.baseFlux * bandMod * snrBoost);
-    addGaussianSource(buffer, gx, gy, psfSigmaPx, amp);
+  const v00 = flux[y0 * ancho + x0];
+  const v10 = flux[y0 * ancho + x1];
+  const v01 = flux[y1 * ancho + x0];
+  const v11 = flux[y1 * ancho + x1];
+
+  let wSum = 0;
+  let valSum = 0;
+  if (Number.isFinite(v00)) {
+    const w = (1 - fx) * (1 - fy);
+    wSum += w;
+    valSum += v00 * w;
+  }
+  if (Number.isFinite(v10)) {
+    const w = fx * (1 - fy);
+    wSum += w;
+    valSum += v10 * w;
+  }
+  if (Number.isFinite(v01)) {
+    const w = (1 - fx) * fy;
+    wSum += w;
+    valSum += v01 * w;
+  }
+  if (Number.isFinite(v11)) {
+    const w = fx * fy;
+    wSum += w;
+    valSum += v11 * w;
   }
 
-  // Si está activa la superposición histórica AllWISE (2010.5), dibujar también la huella tenue de la posición antigua
-  if (
-    showHistoricalCatalogOverlay &&
-    target &&
-    (target.category === "high-proper-motion" ||
-      target.category === "binary-brown-dwarf")
-  ) {
-    // Posición hace 4 años (Gaia/NEOWISE) y hace 15 años (AllWISE 2010.5)
-    const dtWiseYears = -3.0; // Escala visual comprimida dentro del recorte + posición exacta
-    const wisePos = skyToGrid(
-      (target.pmRaMasYr * dtWiseYears) / 1000,
-      (target.pmDecMasYr * dtWiseYears) / 1000
-    );
-    addGaussianSource(buffer, wisePos.gx, wisePos.gy, psfSigmaPx * 1.25, 1.15);
-  }
-
-  // Render primary challenge target (or field reference center source)
-  const { dRaArcsec, dDecArcsec } = computeTargetOffsetArcsec(
-    target,
-    frame,
-    midYears
-  );
-  const fluxMult = computeTargetFluxMultiplier(target, frame) * snrBoost;
-
-  if (target?.companionSeparationArcsec) {
-    // Par binario de enanas marrones (Epsilon Indi Ba + Bb) + componente brillante comóvil
-    const angle = 0.55 + frame.yearsFromRef * 0.18;
-    const visualSep = Math.max(
-      target.companionSeparationArcsec * 2.2,
-      fovArcsec * 0.028
-    );
-    const halfSep = visualSep * 0.5;
-    const ba = skyToGrid(
-      dRaArcsec - Math.cos(angle) * halfSep,
-      dDecArcsec - Math.sin(angle) * halfSep
-    );
-    const bb = skyToGrid(
-      dRaArcsec + Math.cos(angle) * halfSep,
-      dDecArcsec + Math.sin(angle) * halfSep
-    );
-    addGaussianSource(buffer, ba.gx, ba.gy, psfSigmaPx * 1.18, 3.2 * fluxMult);
-    addGaussianSource(buffer, bb.gx, bb.gy, psfSigmaPx * 1.02, 2.1 * fluxMult);
-
-    // Fuente brillante comóvil en la esquina inferior izquierda (como en WiseView)
-    const comovingBright = skyToGrid(dRaArcsec + 16, dDecArcsec - 14);
-    addGaussianSource(
-      buffer,
-      comovingBright.gx,
-      comovingBright.gy,
-      psfSigmaPx * 1.65,
-      4.4 * snrBoost
-    );
-  } else if (target) {
-    const pos = skyToGrid(dRaArcsec, dDecArcsec);
-    const isVar = target.category === "variable-star";
-    const baseAmp = isVar ? 2.8 : 3.2;
-    const dynamicSigma = isVar
-      ? psfSigmaPx * (0.72 + 0.58 * Math.sqrt(fluxMult))
-      : psfSigmaPx * 1.18;
-    addGaussianSource(buffer, pos.gx, pos.gy, dynamicSigma, baseAmp * fluxMult);
-  } else {
-    const pos = skyToGrid(dRaArcsec, dDecArcsec);
-    addGaussianSource(
-      buffer,
-      pos.gx,
-      pos.gy,
-      psfSigmaPx * 1.15,
-      2.6 * snrBoost
-    );
-  }
-
-  return buffer;
+  return wSum > 1e-6 ? valSum / wSum : Number.NaN;
 }
 
 function mapFluxToRgb(
   val: number,
+  blackLevel: number,
+  span: number,
   isDifference: boolean,
   stretchGain: number,
   colormap: ColormapMode
 ): [number, number, number] {
+  if (!Number.isFinite(val)) {
+    if (colormap === "wiseview-inverted") return [236, 238, 242];
+    return [16, 18, 23];
+  }
+
   if (isDifference) {
-    const norm = Math.tanh(val * stretchGain * 1.15);
+    const scaled = (val / Math.max(span, 1e-6)) * 2.4;
+    const norm = Math.tanh(scaled * stretchGain * 1.15);
     const t = (norm + 1) * 0.5;
     if (colormap === "wiseview-inverted") {
       const inv = Math.round((1 - t) * 255);
@@ -321,9 +302,9 @@ function mapFluxToRgb(
     return [g, g, g];
   }
 
-  const shifted = Math.max(0, val - 0.02);
+  const normalized = Math.max(0, (val - blackLevel) / Math.max(span, 1e-6));
   const stretched =
-    Math.asinh(shifted * stretchGain * 2.4) / Math.asinh(4.5 * stretchGain);
+    Math.asinh(normalized * stretchGain * 3.0) / Math.asinh(3.0 * stretchGain);
   const t = Math.min(1, Math.max(0, stretched));
 
   if (colormap === "wiseview-inverted") {
@@ -344,526 +325,159 @@ function mapFluxToRgb(
   return [v, v, v];
 }
 
-function Camera360Rig({
-  yawDeg,
-  pitchDeg,
-  fovArcsec,
-}: {
-  yawDeg: number;
-  pitchDeg: number;
+function renderRealFitsPixels(params: {
+  gridW: number;
+  gridH: number;
+  activeCutout: DecodedFitsCutout;
+  refCutout: DecodedFitsCutout | null;
+  coaddCutouts: DecodedFitsCutout[];
+  panRaArcsec: number;
+  panDecArcsec: number;
   fovArcsec: number;
-}) {
-  const { camera } = useThree();
-  const targetVecRef = useRef(new THREE.Vector3(0, 0, -1));
-
-  useFrame(() => {
-    const yawRad = THREE.MathUtils.degToRad(yawDeg);
-    const pitchRad = THREE.MathUtils.degToRad(
-      Math.max(-85, Math.min(85, pitchDeg))
-    );
-    const x = -Math.sin(yawRad) * Math.cos(pitchRad);
-    const y = Math.sin(pitchRad);
-    const z = -Math.cos(yawRad) * Math.cos(pitchRad);
-
-    targetVecRef.current.set(x * 100, y * 100, z * 100);
-    camera.position.set(0, 0, 0);
-    camera.lookAt(targetVecRef.current);
-
-    if (camera instanceof THREE.PerspectiveCamera) {
-      const targetFov = Math.max(
-        22,
-        Math.min(88, 22 + (fovArcsec / 240) * 60)
-      );
-      if (Math.abs(camera.fov - targetFov) > 0.05) {
-        camera.fov = THREE.MathUtils.lerp(camera.fov, targetFov, 0.25);
-        camera.updateProjectionMatrix();
-      }
-    }
-  });
-
-  return null;
-}
-
-function AllSky360Stars({
-  centerRaDeg,
-  centerDecDeg,
-  stretchGain,
-  colormap,
-}: {
-  centerRaDeg: number;
-  centerDecDeg: number;
+  playbackMode: PlaybackMode;
   stretchGain: number;
   colormap: ColormapMode;
-}) {
-  const { positions, colors } = useMemo(() => {
-    const total = 3600;
-    const pos = new Float32Array(total * 3);
-    const col = new Float32Array(total * 3);
-    const rand = mulberry32(
-      Math.round(centerRaDeg * 100 + (centerDecDeg + 90) * 100) ^ 0x9e3779b9
-    );
+}): Uint8ClampedArray {
+  const {
+    gridW,
+    gridH,
+    activeCutout,
+    refCutout,
+    coaddCutouts,
+    panRaArcsec,
+    panDecArcsec,
+    fovArcsec,
+    playbackMode,
+    stretchGain,
+    colormap,
+  } = params;
 
-    const isInverted = colormap === "wiseview-inverted";
-    const isThermal = colormap === "infrared";
+  const isDiff = playbackMode === "difference" && refCutout !== null;
+  const isSum = playbackMode === "sum" && refCutout !== null;
 
-    for (let i = 0; i < total; i++) {
-      // Distribución isótropa en 360° + banda galáctica infrarroja SPHEREx
-      const isGalacticPlane = i < 1200;
-      const lon = rand() * Math.PI * 2;
-      let lat: number;
-      if (isGalacticPlane) {
-        const u1 = Math.max(1e-5, rand());
-        const u2 = rand();
-        const gauss =
-          Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-        lat = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, gauss * 0.16));
+  const blackLevel = Math.max(
+    activeCutout.vmin,
+    activeCutout.mediana -
+      1.2 * Math.max(activeCutout.ruidoMad, (activeCutout.vmax - activeCutout.vmin) * 0.02)
+  );
+  const span = Math.max(activeCutout.vmax - blackLevel, 1e-6);
+
+  const pxPerArcsec = gridH / fovArcsec;
+  const rgba = new Uint8ClampedArray(gridW * gridH * 4);
+  const stackList =
+    coaddCutouts.length > 1
+      ? coaddCutouts.filter((c) => c.coberturaWcs === activeCutout.coberturaWcs)
+      : [];
+  const useStack = stackList.length > 1;
+
+  for (let gy = 0; gy < gridH; gy++) {
+    const dDec = -((gy + 0.5 - gridH * 0.5) / pxPerArcsec) + panDecArcsec;
+    for (let gx = 0; gx < gridW; gx++) {
+      const dRa = -((gx + 0.5 - gridW * 0.5) / pxPerArcsec) + panRaArcsec;
+
+      let primaryVal: number;
+      if (useStack) {
+        let sum = 0;
+        let count = 0;
+        for (const c of stackList) {
+          const s = sampleCutoutBilinear(c, dRa, dDec);
+          if (Number.isFinite(s)) {
+            sum += s;
+            count += 1;
+          }
+        }
+        primaryVal = count > 0 ? sum / count : Number.NaN;
       } else {
-        lat = Math.asin(2 * rand() - 1);
+        primaryVal = sampleCutoutBilinear(activeCutout, dRa, dDec);
       }
 
-      const r = 92;
-      let x = r * Math.cos(lat) * Math.sin(lon);
-      let y = r * Math.sin(lat);
-      let z = -r * Math.cos(lat) * Math.cos(lon);
-
-      if (isGalacticPlane) {
-        const tilt = 0.58;
-        const ny = y * Math.cos(tilt) - z * Math.sin(tilt);
-        const nz = y * Math.sin(tilt) + z * Math.cos(tilt);
-        y = ny;
-        z = nz;
-      }
-
-      pos[i * 3] = x;
-      pos[i * 3 + 1] = y;
-      pos[i * 3 + 2] = z;
-
-      const temp = rand();
-      const bright = Math.min(
-        1,
-        (0.35 + Math.pow(rand(), 2.2) * 0.65) * Math.min(1.6, stretchGain)
-      );
-
-      if (isInverted) {
-        const v = Math.max(0.05, 1 - bright * 0.88);
-        col[i * 3] = v;
-        col[i * 3 + 1] = v;
-        col[i * 3 + 2] = Math.min(1, v + 0.04);
-      } else if (isThermal) {
-        col[i * 3] = Math.min(1, bright * 1.15);
-        col[i * 3 + 1] = bright * (0.45 + temp * 0.45);
-        col[i * 3 + 2] = bright * (0.15 + temp * 0.25);
-      } else {
-        // Colores estelares espectrales realistas (O/B azulados, G/K blancos/ámbar, M rojizos)
-        if (temp < 0.22) {
-          col[i * 3] = bright * 1.0;
-          col[i * 3 + 1] = bright * 0.68;
-          col[i * 3 + 2] = bright * 0.48;
-        } else if (temp < 0.68) {
-          col[i * 3] = bright * 0.98;
-          col[i * 3 + 1] = bright * 0.95;
-          col[i * 3 + 2] = bright * 0.88;
+      let displayVal = primaryVal;
+      if ((isDiff || isSum) && refCutout) {
+        const refVal = sampleCutoutBilinear(refCutout, dRa, dDec);
+        if (Number.isFinite(primaryVal) && Number.isFinite(refVal)) {
+          displayVal = isDiff
+            ? primaryVal - refVal
+            : (primaryVal + refVal) * 0.5;
         } else {
-          col[i * 3] = bright * 0.76;
-          col[i * 3 + 1] = bright * 0.88;
-          col[i * 3 + 2] = bright * 1.0;
+          displayVal = Number.NaN;
         }
       }
+
+      const [r, g, b] = mapFluxToRgb(
+        displayVal,
+        blackLevel,
+        span,
+        isDiff,
+        stretchGain,
+        colormap
+      );
+      const idx = (gy * gridW + gx) * 4;
+      rgba[idx] = r;
+      rgba[idx + 1] = g;
+      rgba[idx + 2] = b;
+      rgba[idx + 3] = 255;
     }
+  }
 
-    return { positions: pos, colors: col };
-  }, [centerRaDeg, centerDecDeg, stretchGain, colormap]);
-
-  return (
-    <points>
-      <bufferGeometry>
-        <bufferAttribute
-          attach="attributes-position"
-          args={[positions, 3]}
-        />
-        <bufferAttribute attach="attributes-color" args={[colors, 3]} />
-      </bufferGeometry>
-      <pointsMaterial
-        vertexColors
-        size={2.1}
-        sizeAttenuation={false}
-        transparent
-        opacity={0.92}
-      />
-    </points>
-  );
+  return rgba;
 }
 
-function CelestialGrid360({
-  showGrid,
-  isLightSky,
-}: {
-  showGrid: boolean;
-  isLightSky: boolean;
-}) {
-  const linePositions = useMemo(() => {
-    const pts: number[] = [];
-    const r = 88;
-    const segs = 72;
-
-    // Paralelos de declinación (-60°, -30°, 0°, +30°, +60°)
-    const decList = showGrid ? [-60, -30, 0, 30, 60] : [0];
-    for (const decDeg of decList) {
-      const lat = THREE.MathUtils.degToRad(decDeg);
-      const y = r * Math.sin(lat);
-      const rad = r * Math.cos(lat);
-      for (let i = 0; i < segs; i++) {
-        const a0 = (i / segs) * Math.PI * 2;
-        const a1 = ((i + 1) / segs) * Math.PI * 2;
-        pts.push(
-          rad * Math.sin(a0),
-          y,
-          -rad * Math.cos(a0),
-          rad * Math.sin(a1),
-          y,
-          -rad * Math.cos(a1)
-        );
-      }
-    }
-
-    // Meridianos de ascensión recta cada 30° (2h)
-    const raStep = showGrid ? 30 : 90;
-    for (let raDeg = 0; raDeg < 360; raDeg += raStep) {
-      const lon = THREE.MathUtils.degToRad(raDeg);
-      for (let i = 0; i < segs; i++) {
-        const lat0 = -Math.PI / 2 + (i / segs) * Math.PI;
-        const lat1 = -Math.PI / 2 + ((i + 1) / segs) * Math.PI;
-        pts.push(
-          r * Math.cos(lat0) * Math.sin(lon),
-          r * Math.sin(lat0),
-          -r * Math.cos(lat0) * Math.cos(lon),
-          r * Math.cos(lat1) * Math.sin(lon),
-          r * Math.sin(lat1),
-          -r * Math.cos(lat1) * Math.cos(lon)
-        );
-      }
-    }
-
-    return new Float32Array(pts);
-  }, [showGrid]);
-
-  return (
-    <lineSegments>
-      <bufferGeometry>
-        <bufferAttribute
-          attach="attributes-position"
-          args={[linePositions, 3]}
-        />
-      </bufferGeometry>
-      <lineBasicMaterial
-        color={isLightSky ? "#171717" : "#38bdf8"}
-        transparent
-        opacity={showGrid ? 0.24 : 0.1}
-      />
-    </lineSegments>
+function measureApertureFlux(
+  cutout: DecodedFitsCutout,
+  dRaArcsec: number,
+  dDecArcsec: number,
+  centerRaDeg: number,
+  centerDecDeg: number
+): { fluxPeak: number; excessFlux: number; isRealSource: boolean; raDeg: number; decDeg: number } {
+  const scaleFactor = cutout.coberturaWcs
+    ? 1.0
+    : cutout.fovArcsec / Math.max(DEFAULT_FOV_ARCSEC, 1);
+  const cx = Math.round(
+    (cutout.ancho - 1) * 0.5 - (dRaArcsec * scaleFactor) / cutout.pixscaleArcsec
   );
-}
-
-function SkySphere360Scene({
-  centerRaDeg,
-  centerDecDeg,
-  frames,
-  activeFrame,
-  midYears,
-  activeTarget,
-  fovArcsec,
-  stretchGain,
-  colormap,
-  showGrid,
-  showTargetOverlay,
-  showHistoricalCatalogOverlay,
-  yawDeg,
-  pitchDeg,
-  onSelectSkySource,
-}: {
-  centerRaDeg: number;
-  centerDecDeg: number;
-  frames: EpochFrame[];
-  activeFrame: EpochFrame;
-  midYears: number;
-  activeTarget: ChallengeTarget | null;
-  fovArcsec: number;
-  stretchGain: number;
-  colormap: ColormapMode;
-  showGrid: boolean;
-  showTargetOverlay: boolean;
-  showHistoricalCatalogOverlay: boolean;
-  yawDeg: number;
-  pitchDeg: number;
-  onSelectSkySource?: (source: SelectedSkySource) => void;
-}) {
-  const isLightSky = colormap === "wiseview-inverted";
-  const localStars = useMemo(
-    () => generateBackgroundStars(centerRaDeg, centerDecDeg),
-    [centerRaDeg, centerDecDeg]
+  const cy = Math.round(
+    (cutout.alto - 1) * 0.5 - (dDecArcsec * scaleFactor) / cutout.pixscaleArcsec
   );
 
-  // Convierte desplazamientos locales en arcsec (dRa, dDec) a coordenadas 3D frente al observador
-  const arcsecTo3D = (
-    dRaArcsec: number,
-    dDecArcsec: number,
-    dist = 42
-  ): [number, number, number] => {
-    const scale = 0.22;
-    const az = THREE.MathUtils.degToRad(-dRaArcsec * scale);
-    const el = THREE.MathUtils.degToRad(dDecArcsec * scale);
-    return [
-      dist * Math.cos(el) * Math.sin(az),
-      dist * Math.sin(el),
-      -dist * Math.cos(el) * Math.cos(az),
-    ];
+  let peak = sampleCutoutBilinear(cutout, dRaArcsec, dDecArcsec);
+  let bestX = cx;
+  let bestY = cy;
+
+  for (let dy = -2; dy <= 2; dy++) {
+    const yy = cy + dy;
+    if (yy < 0 || yy >= cutout.alto) continue;
+    for (let dx = -2; dx <= 2; dx++) {
+      const xx = cx + dx;
+      if (xx < 0 || xx >= cutout.ancho) continue;
+      const val = cutout.flux[yy * cutout.ancho + xx];
+      if (Number.isFinite(val) && (!Number.isFinite(peak) || val > peak)) {
+        peak = val;
+        bestX = xx;
+        bestY = yy;
+      }
+    }
+  }
+
+  const peakDRa =
+    (((cutout.ancho - 1) * 0.5 - bestX) * cutout.pixscaleArcsec) / scaleFactor;
+  const peakDDec =
+    (((cutout.alto - 1) * 0.5 - bestY) * cutout.pixscaleArcsec) / scaleFactor;
+  const cosDec = Math.max(0.1, Math.cos((centerDecDeg * Math.PI) / 180));
+  const raDeg =
+    (((centerRaDeg + peakDRa / (3600 * cosDec)) % 360) + 360) % 360;
+  const decDeg = Math.max(-90, Math.min(90, centerDecDeg + peakDDec / 3600));
+
+  const safePeak = Number.isFinite(peak) ? peak : cutout.mediana;
+  const excessFlux = safePeak - cutout.mediana;
+  const snrThreshold = Math.max(cutout.ruidoMad * 3.0, (cutout.vmax - cutout.mediana) * 0.2);
+
+  return {
+    fluxPeak: safePeak,
+    excessFlux,
+    isRealSource: excessFlux > snrThreshold,
+    raDeg,
+    decDeg,
   };
-
-  const curOffset = computeTargetOffsetArcsec(
-    activeTarget,
-    activeFrame,
-    midYears
-  );
-  const fluxMult = computeTargetFluxMultiplier(activeTarget, activeFrame);
-  const targetPos = arcsecTo3D(curOffset.dRaArcsec, curOffset.dDecArcsec, 40);
-
-  const trajectoryPoints = useMemo(() => {
-    if (frames.length < 2) return null;
-    const first = computeTargetOffsetArcsec(activeTarget, frames[0], midYears);
-    const last = computeTargetOffsetArcsec(
-      activeTarget,
-      frames[frames.length - 1],
-      midYears
-    );
-    const p0 = arcsecTo3D(first.dRaArcsec, first.dDecArcsec, 40);
-    const p1 = arcsecTo3D(last.dRaArcsec, last.dDecArcsec, 40);
-    return new Float32Array([...p0, ...p1]);
-  }, [activeTarget, frames, midYears]);
-
-  const wiseOldPos = useMemo(() => {
-    if (!activeTarget) return null;
-    const dRa = (activeTarget.pmRaMasYr * -3.0) / 1000;
-    const dDec = (activeTarget.pmDecMasYr * -3.0) / 1000;
-    return arcsecTo3D(dRa, dDec, 40);
-  }, [activeTarget]);
-
-  const bgColor = isLightSky
-    ? "#f6f7f9"
-    : colormap === "infrared"
-    ? "#0b0308"
-    : "#04060b";
-
-  return (
-    <>
-      <color attach="background" args={[bgColor]} />
-      <Camera360Rig
-        yawDeg={yawDeg}
-        pitchDeg={pitchDeg}
-        fovArcsec={fovArcsec}
-      />
-
-      {/* Domo esférico 360° de fondo */}
-      <mesh>
-        <sphereGeometry args={[96, 48, 32]} />
-        <meshBasicMaterial
-          color={bgColor}
-          side={THREE.BackSide}
-          depthWrite={false}
-        />
-      </mesh>
-
-      {/* Estrellas 360° de todo el cielo + Vía Láctea Infrarroja */}
-      <AllSky360Stars
-        centerRaDeg={centerRaDeg}
-        centerDecDeg={centerDecDeg}
-        stretchGain={stretchGain}
-        colormap={colormap}
-      />
-
-      {/* Rejilla celeste 360° (RA / Dec) */}
-      <CelestialGrid360 showGrid={showGrid} isLightSky={isLightSky} />
-
-      {/* Estrellas de campo de la región SPHEREx activa (interactivas con clic) */}
-      <group>
-        {localStars.slice(0, 75).map((st) => {
-          const pos = arcsecTo3D(st.dRaArcsec, st.dDecArcsec, 42);
-          const radius = Math.max(
-            0.12,
-            Math.min(0.46, 0.11 + Math.sqrt(st.baseFlux) * 0.14 * stretchGain)
-          );
-          const starColor = isLightSky
-            ? "#1e293b"
-            : colormap === "infrared"
-            ? "#fb923c"
-            : st.spectralSlope > 0.1
-            ? "#fdba74"
-            : "#e2e8f0";
-          return (
-            <mesh
-              key={st.id}
-              position={pos}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!onSelectSkySource) return;
-                const cosDec = Math.max(
-                  0.1,
-                  Math.cos((centerDecDeg * Math.PI) / 180)
-                );
-                const stRa =
-                  (((centerRaDeg + st.dRaArcsec / (3600 * cosDec)) % 360) +
-                    360) %
-                  360;
-                const stDec = Math.max(
-                  -90,
-                  Math.min(90, centerDecDeg + st.dDecArcsec / 3600)
-                );
-                onSelectSkySource({
-                  id: st.id,
-                  label: `Estrella de campo ${st.id}`,
-                  raDeg: stRa,
-                  decDeg: stDec,
-                  dRaArcsec: st.dRaArcsec,
-                  dDecArcsec: st.dDecArcsec,
-                  isPrimaryTarget: false,
-                  spectralSlope: st.spectralSlope,
-                  baseFlux: st.baseFlux,
-                  spectralType:
-                    st.spectralSlope > 0.1
-                      ? "Enana M / Fuente fría IR"
-                      : "Estrella de secuencia principal G/K",
-                });
-              }}
-            >
-              <sphereGeometry args={[radius, 12, 12]} />
-              <meshBasicMaterial color={starColor} />
-            </mesh>
-          );
-        })}
-      </group>
-
-      {/* Otros objetos del reto distribuidos por la bóveda celeste 360° */}
-      <group>
-        {CHALLENGE_TARGETS.filter((t) => t.id !== activeTarget?.id).map((t) => {
-          const dRaDeg = t.raDeg - centerRaDeg;
-          const dDecDeg = t.decDeg - centerDecDeg;
-          const lon = THREE.MathUtils.degToRad(-dRaDeg);
-          const lat = THREE.MathUtils.degToRad(dDecDeg * 0.6);
-          const r = 75;
-          const pos: [number, number, number] = [
-            r * Math.cos(lat) * Math.sin(lon),
-            r * Math.sin(lat),
-            -r * Math.cos(lat) * Math.cos(lon),
-          ];
-          return (
-            <mesh key={t.id} position={pos}>
-              <sphereGeometry args={[0.55, 16, 16]} />
-              <meshBasicMaterial
-                color={isLightSky ? "#0284c7" : "#38bdf8"}
-              />
-            </mesh>
-          );
-        })}
-      </group>
-
-      {/* Trayectoria temporal 3D y comparación con AllWISE (2010) */}
-      {showTargetOverlay && trajectoryPoints && (
-        <line>
-          <bufferGeometry>
-            <bufferAttribute
-              attach="attributes-position"
-              args={[trajectoryPoints, 3]}
-            />
-          </bufferGeometry>
-          <lineBasicMaterial
-            color={isLightSky ? "#171717" : "#38bdf8"}
-            transparent
-            opacity={0.75}
-          />
-        </line>
-      )}
-
-      {showHistoricalCatalogOverlay && wiseOldPos && (
-        <mesh position={wiseOldPos}>
-          <ringGeometry args={[0.55, 0.72, 24]} />
-          <meshBasicMaterial
-            color="#f59e0b"
-            side={THREE.DoubleSide}
-            transparent
-            opacity={0.85}
-          />
-        </mesh>
-      )}
-
-      {/* Estrella objetivo principal animada entre épocas en el espacio 3D */}
-      <group
-        position={targetPos}
-        onClick={(e) => {
-          e.stopPropagation();
-          onSelectSkySource?.({
-            id: activeTarget?.id ?? "primary-center",
-            label: activeTarget?.name ?? "Objeto central SPHEREx",
-            raDeg: centerRaDeg,
-            decDeg: centerDecDeg,
-            dRaArcsec: curOffset.dRaArcsec,
-            dDecArcsec: curOffset.dDecArcsec,
-            isPrimaryTarget: true,
-            spectralSlope: 0,
-            baseFlux: 2.8 * fluxMult,
-            spectralType:
-              activeTarget?.categoryLabel ?? "Fuente puntual infrarroja",
-          });
-        }}
-      >
-        <mesh>
-          <sphereGeometry
-            args={[
-              Math.max(0.35, Math.min(1.15, 0.48 * Math.sqrt(fluxMult))),
-              24,
-              24,
-            ]}
-          />
-          <meshBasicMaterial
-            color={
-              isLightSky
-                ? "#0f172a"
-                : activeTarget?.id === "wise-0855"
-                ? "#f97316"
-                : "#fde047"
-            }
-          />
-        </mesh>
-
-        {/* Compañera binaria en 3D para Epsilon Indi B (Ba + Bb) */}
-        {activeTarget?.category === "binary-brown-dwarf" && (
-          <mesh position={[-0.95, 0.42, 0]}>
-            <sphereGeometry args={[0.32, 16, 16]} />
-            <meshBasicMaterial
-              color={isLightSky ? "#334155" : "#fb923c"}
-            />
-          </mesh>
-        )}
-
-        {/* Anillo marcador 3D alrededor de la muestra activa */}
-        {showTargetOverlay && (
-          <mesh>
-            <ringGeometry
-              args={[
-                1.05 * Math.sqrt(fluxMult),
-                1.22 * Math.sqrt(fluxMult),
-                32,
-              ]}
-            />
-            <meshBasicMaterial
-              color={isLightSky ? "#171717" : "#ffffff"}
-              side={THREE.DoubleSide}
-              transparent
-              opacity={0.85}
-            />
-          </mesh>
-        )}
-      </group>
-    </>
-  );
 }
 
 export default function SkyVideoCanvas({
@@ -886,31 +500,14 @@ export default function SkyVideoCanvas({
   onSelectSkySource,
   onZoomChange,
   fullViewport = false,
-  view360 = false,
 }: SkyVideoCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const offscreenRef = useRef<HTMLCanvasElement | null>(null);
-  const [panArcsec, setPanArcsec] = useState<{ ra: number; dec: number }>({
-    ra: 0,
-    dec: 0,
-  });
-  const [rot360, setRot360] = useState<{ yaw: number; pitch: number }>({
-    yaw: 0,
-    pitch: 0,
-  });
-  const rotDragRef = useRef<{
-    active: boolean;
-    startX: number;
-    startY: number;
-    startYaw: number;
-    startPitch: number;
-  }>({
-    active: false,
-    startX: 0,
-    startY: 0,
-    startYaw: 0,
-    startPitch: 0,
-  });
+  const [panArcsec, setPanArcsec] = useState({ ra: 0, dec: 0 });
+  const [cacheTick, setCacheTick] = useState(0);
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const [frameErrors, setFrameErrors] = useState<Record<string, string>>({});
+
   const [cursorSky, setCursorSky] = useState<{
     raDeg: number;
     decDeg: number;
@@ -938,6 +535,137 @@ export default function SkyVideoCanvas({
       ? frames[Math.floor((frames.length - 1) / 2)].yearsFromRef
       : 0;
 
+  const fetchFovArcsec = pickFetchFovArcsec(fovArcsec);
+  const activeKey = activeFrame
+    ? buildCutoutKey(
+        activeFrame.observacion.url_acceso,
+        centerRaDeg,
+        centerDecDeg,
+        fetchFovArcsec
+      )
+    : null;
+  const refKey = refFrame
+    ? buildCutoutKey(
+        refFrame.observacion.url_acceso,
+        centerRaDeg,
+        centerDecDeg,
+        fetchFovArcsec
+      )
+    : null;
+
+  useEffect(() => {
+    if (frames.length === 0) return;
+    let cancelled = false;
+
+    const queue: Array<{ fitsUrl: string; key: string }> = [];
+    const seen = new Set<string>();
+
+    const enqueue = (frame: EpochFrame | undefined) => {
+      if (!frame) return;
+      const fitsUrl = frame.observacion.url_acceso;
+      const key = buildCutoutKey(
+        fitsUrl,
+        centerRaDeg,
+        centerDecDeg,
+        fetchFovArcsec
+      );
+      if (seen.has(key) || cutoutMemoryCache.has(key)) return;
+      seen.add(key);
+      queue.push({ fitsUrl, key });
+    };
+
+    enqueue(activeFrame);
+    if (playbackMode === "difference" || playbackMode === "sum") {
+      enqueue(refFrame);
+    }
+    const maxPrefetch = stackByDetector ? frames.length : Math.min(frames.length, 8);
+    for (let i = 0; i < maxPrefetch; i++) {
+      enqueue(frames[i]);
+    }
+
+    if (queue.length === 0) return;
+
+    let cursor = 0;
+    const workerCount = Math.min(PREFETCH_CONCURRENCY, queue.length);
+
+    async function runWorker() {
+      while (!cancelled) {
+        const idx = cursor++;
+        if (idx >= queue.length) break;
+        const item = queue[idx];
+        try {
+          await fetchDecodedFitsCutout(
+            item.fitsUrl,
+            centerRaDeg,
+            centerDecDeg,
+            fetchFovArcsec
+          );
+          if (!cancelled) {
+            setFrameErrors((prev) => {
+              if (!(item.key in prev)) return prev;
+              const next = { ...prev };
+              delete next[item.key];
+              return next;
+            });
+            setCacheTick((t) => t + 1);
+          }
+        } catch (err) {
+          if (!cancelled) {
+            const msg =
+              err instanceof Error
+                ? err.message
+                : "Error al cargar el recorte FITS.";
+            setFrameErrors((prev) => ({ ...prev, [item.key]: msg }));
+          }
+        }
+      }
+    }
+
+    void Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    frames,
+    activeFrame,
+    refFrame,
+    centerRaDeg,
+    centerDecDeg,
+    fetchFovArcsec,
+    playbackMode,
+    stackByDetector,
+    reloadNonce,
+  ]);
+
+  const activeCutout = useMemo(() => {
+    void cacheTick;
+    return activeKey ? cutoutMemoryCache.get(activeKey) ?? null : null;
+  }, [activeKey, cacheTick]);
+
+  const refCutout = useMemo(() => {
+    void cacheTick;
+    return refKey ? cutoutMemoryCache.get(refKey) ?? null : null;
+  }, [refKey, cacheTick]);
+
+  const coaddCutouts = useMemo(() => {
+    void cacheTick;
+    if (!stackByDetector) return [];
+    const list: DecodedFitsCutout[] = [];
+    for (const fr of frames) {
+      const k = buildCutoutKey(
+        fr.observacion.url_acceso,
+        centerRaDeg,
+        centerDecDeg,
+        fetchFovArcsec
+      );
+      const item = cutoutMemoryCache.get(k);
+      if (item) list.push(item);
+    }
+    return list;
+  }, [stackByDetector, frames, centerRaDeg, centerDecDeg, fetchFovArcsec, cacheTick]);
+
+  const activeError = activeKey ? frameErrors[activeKey] ?? null : null;
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !activeFrame) return;
@@ -956,76 +684,54 @@ export default function SkyVideoCanvas({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    const isLightSky = colormap === "wiseview-inverted";
+
+    if (!activeCutout) {
+      ctx.save();
+      ctx.scale(dpr, dpr);
+      ctx.fillStyle = isLightSky ? "#f4f5f7" : "#07090e";
+      ctx.fillRect(0, 0, cssWidth, cssHeight);
+      ctx.restore();
+      return;
+    }
+
+    const aspect = cssWidth / Math.max(cssHeight, 1);
+    const gridH = OFFSCREEN_HEIGHT;
+    const gridW = Math.max(120, Math.min(720, Math.round(gridH * aspect)));
+
     if (!offscreenRef.current) {
       offscreenRef.current = document.createElement("canvas");
-      offscreenRef.current.width = GRID_W;
-      offscreenRef.current.height = GRID_H;
     }
     const offscreen = offscreenRef.current;
+    if (offscreen.width !== gridW || offscreen.height !== gridH) {
+      offscreen.width = gridW;
+      offscreen.height = gridH;
+    }
     const offCtx = offscreen.getContext("2d");
     if (!offCtx) return;
 
-    const stars = generateBackgroundStars(centerRaDeg, centerDecDeg);
-    const currentBuffer = renderEpochFluxBuffer({
-      frame: activeFrame,
-      midYears,
-      stars,
-      target: activeTarget,
+    const rgba = renderRealFitsPixels({
+      gridW,
+      gridH,
+      activeCutout,
+      refCutout,
+      coaddCutouts,
       panRaArcsec: panArcsec.ra,
       panDecArcsec: panArcsec.dec,
       fovArcsec,
-      stackByDetector,
-      showHistoricalCatalogOverlay,
+      playbackMode,
+      stretchGain,
+      colormap,
     });
 
-    const isDiff = playbackMode === "difference" && Boolean(refFrame);
-    const isSum = playbackMode === "sum" && Boolean(refFrame);
-    let displayBuffer = currentBuffer;
-
-    if ((isDiff || isSum) && refFrame) {
-      const refBuffer = renderEpochFluxBuffer({
-        frame: refFrame,
-        midYears,
-        stars,
-        target: activeTarget,
-        panRaArcsec: panArcsec.ra,
-        panDecArcsec: panArcsec.dec,
-        fovArcsec,
-        stackByDetector,
-        showHistoricalCatalogOverlay,
-      });
-      displayBuffer = new Float32Array(currentBuffer.length);
-      if (isDiff) {
-        for (let i = 0; i < currentBuffer.length; i++) {
-          displayBuffer[i] = currentBuffer[i] - refBuffer[i];
-        }
-      } else {
-        for (let i = 0; i < currentBuffer.length; i++) {
-          displayBuffer[i] = (currentBuffer[i] + refBuffer[i]) * 0.58;
-        }
-      }
-    }
-
-    const imgData = offCtx.createImageData(GRID_W, GRID_H);
-    const pixels = imgData.data;
-    for (let i = 0; i < displayBuffer.length; i++) {
-      const [r, g, b] = mapFluxToRgb(
-        displayBuffer[i],
-        isDiff,
-        stretchGain,
-        colormap
-      );
-      const p = i * 4;
-      pixels[p] = r;
-      pixels[p + 1] = g;
-      pixels[p + 2] = b;
-      pixels[p + 3] = 255;
-    }
+    const imgData = offCtx.createImageData(gridW, gridH);
+    imgData.data.set(rgba);
     offCtx.putImageData(imgData, 0, 0);
 
     ctx.save();
     ctx.scale(dpr, dpr);
-    ctx.imageSmoothingEnabled = false;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
     ctx.drawImage(offscreen, 0, 0, cssWidth, cssHeight);
 
     const pxPerArcsec = cssHeight / fovArcsec;
@@ -1034,7 +740,6 @@ export default function SkyVideoCanvas({
       y: cssHeight / 2 - (dDecArcsec - panArcsec.dec) * pxPerArcsec,
     });
 
-    const isLightSky = colormap === "wiseview-inverted";
     const overlayMuted = isLightSky
       ? "rgba(23, 23, 23, 0.28)"
       : "rgba(237, 237, 237, 0.28)";
@@ -1043,13 +748,28 @@ export default function SkyVideoCanvas({
       : "rgba(237, 237, 237, 0.88)";
     const overlayAccent = isLightSky ? "#171717" : "#ededed";
 
-    // Optional WCS Grid
     if (showGrid) {
-      const stepArcsec = fovArcsec > 140 ? 40 : fovArcsec > 65 ? 20 : 10;
+      const halfH = fovArcsec * 0.5;
+      const halfW = halfH * aspect;
+      const stepArcsec =
+        fovArcsec >= 1800
+          ? 600
+          : fovArcsec >= 600
+          ? 180
+          : fovArcsec >= 240
+          ? 60
+          : fovArcsec >= 90
+          ? 30
+          : 15;
+      const startRa = Math.floor((panArcsec.ra - halfW) / stepArcsec) * stepArcsec;
+      const endRa = Math.ceil((panArcsec.ra + halfW) / stepArcsec) * stepArcsec;
+      const startDec = Math.floor((panArcsec.dec - halfH) / stepArcsec) * stepArcsec;
+      const endDec = Math.ceil((panArcsec.dec + halfH) / stepArcsec) * stepArcsec;
+
       ctx.strokeStyle = overlayMuted;
       ctx.lineWidth = 1;
       ctx.setLineDash([3, 3]);
-      for (let off = -180; off <= 180; off += stepArcsec) {
+      for (let off = startRa; off <= endRa; off += stepArcsec) {
         const vx = skyToCss(off, 0).x;
         if (vx >= 0 && vx <= cssWidth) {
           ctx.beginPath();
@@ -1057,6 +777,8 @@ export default function SkyVideoCanvas({
           ctx.lineTo(vx, cssHeight);
           ctx.stroke();
         }
+      }
+      for (let off = startDec; off <= endDec; off += stepArcsec) {
         const hy = skyToCss(0, off).y;
         if (hy >= 0 && hy <= cssHeight) {
           ctx.beginPath();
@@ -1068,7 +790,6 @@ export default function SkyVideoCanvas({
       ctx.setLineDash([]);
     }
 
-    // Optional Central Crosshair
     if (showCrosshair) {
       const centerPos = skyToCss(0, 0);
       ctx.strokeStyle = overlayMuted;
@@ -1085,7 +806,6 @@ export default function SkyVideoCanvas({
       ctx.stroke();
     }
 
-    // Comparación con catálogos antiguos (AllWISE 2010 / Gaia DR3 2016)
     if (
       showHistoricalCatalogOverlay &&
       activeTarget &&
@@ -1109,7 +829,6 @@ export default function SkyVideoCanvas({
       const pGaia = skyToCss(gaiaRefOffset.dRaArcsec, gaiaRefOffset.dDecArcsec);
       const pCur = skyToCss(curOffset.dRaArcsec, curOffset.dDecArcsec);
 
-      // Vector desde posición antigua (WISE/Gaia) hasta época actual SPHEREx
       ctx.strokeStyle = "#f59e0b";
       ctx.lineWidth = 1.5;
       ctx.setLineDash([3, 3]);
@@ -1119,28 +838,20 @@ export default function SkyVideoCanvas({
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Marcador AllWISE (ámbar)
       ctx.strokeStyle = "#f59e0b";
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 1.6;
       ctx.beginPath();
-      ctx.arc(pWise.x, pWise.y, 10, 0, Math.PI * 2);
+      ctx.arc(pWise.x, pWise.y, 7, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.font = "10px monospace";
-      ctx.fillStyle = isLightSky ? "#b45309" : "#fbbf24";
-      ctx.fillText("WISE/NEOWISE (época antigua)", pWise.x + 13, pWise.y + 3);
 
-      // Marcador Gaia DR3 (cian)
       ctx.strokeStyle = "#06b6d4";
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 1.6;
       ctx.beginPath();
-      ctx.rect(pGaia.x - 5, pGaia.y - 5, 10, 10);
+      ctx.arc(pGaia.x, pGaia.y, 5.5, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.fillStyle = isLightSky ? "#0e7490" : "#22d3ee";
-      ctx.fillText("Gaia DR3", pGaia.x + 10, pGaia.y - 4);
     }
 
-    // Optional Target Motion / Variability Overlay
-    if (showTargetOverlay) {
+    if (showTargetOverlay && activeTarget) {
       const firstOffset = computeTargetOffsetArcsec(
         activeTarget,
         frames[0],
@@ -1169,7 +880,6 @@ export default function SkyVideoCanvas({
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Puntos de posición de cada época a lo largo de la trayectoria
       for (const fr of frames) {
         const off = computeTargetOffsetArcsec(activeTarget, fr, midYears);
         const pf = skyToCss(off.dRaArcsec, off.dDecArcsec);
@@ -1186,54 +896,13 @@ export default function SkyVideoCanvas({
         ctx.fill();
       }
 
-      const mult = computeTargetFluxMultiplier(activeTarget, activeFrame);
-      const ringRadius =
-        activeTarget?.category === "variable-star"
-          ? Math.max(10, Math.min(24, 11 + mult * 4.5))
-          : 14;
-
       ctx.strokeStyle = overlayAccent;
       ctx.lineWidth = 1.6;
       ctx.beginPath();
-      ctx.arc(pc.x, pc.y, ringRadius, 0, Math.PI * 2);
+      ctx.arc(pc.x, pc.y, 14, 0, Math.PI * 2);
       ctx.stroke();
-
-      ctx.font = "bold 11px monospace";
-      ctx.fillStyle = overlayText;
-      const targetTitle = activeTarget
-        ? activeTarget.category === "variable-star"
-          ? `${activeTarget.name} (${mult.toFixed(2)}x flujo)`
-          : `${activeTarget.name}`
-        : "Candidato en movimiento";
-      ctx.fillText(targetTitle, pc.x + ringRadius + 5, pc.y - 4);
     }
 
-    // Cabecera de ventana deslizante estilo WiseView (ej. "2016.3 - 2016.8") + riel vertical de épocas
-    if (activeFrame.wiseWindowLabel) {
-      ctx.fillStyle = "rgba(0, 0, 0, 0.72)";
-      ctx.fillRect(10, 10, 195, 30);
-      ctx.font = "bold 16px monospace";
-      ctx.fillStyle = "#ffffff";
-      ctx.fillText(activeFrame.wiseWindowLabel, 18, 31);
-
-      // Riel vertical de épocas en el margen izquierdo (· · + + · · como en WiseView)
-      for (let i = 0; i < frames.length; i++) {
-        const ry = 54 + i * 16;
-        const isCurrent =
-          i === activeFrame.index ||
-          Math.abs(i - activeFrame.index) === 1;
-        ctx.font = "bold 12px monospace";
-        ctx.fillStyle =
-          i === activeFrame.index
-            ? overlayAccent
-            : isCurrent
-            ? overlayText
-            : overlayMuted;
-        ctx.fillText(i === activeFrame.index ? "+" : "·", 14, ry);
-      }
-    }
-
-    // Retícula espectroscópica sobre la estrella seleccionada con clic
     if (selectedSource && !selectedSource.isPrimaryTarget) {
       const ps = skyToCss(selectedSource.dRaArcsec, selectedSource.dDecArcsec);
       ctx.strokeStyle = "#10b981";
@@ -1241,40 +910,46 @@ export default function SkyVideoCanvas({
       ctx.beginPath();
       ctx.arc(ps.x, ps.y, 12, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.font = "10px monospace";
-      ctx.fillStyle = isLightSky ? "#047857" : "#34d399";
-      ctx.fillText(
-        `${selectedSource.label} (Espectro 102 ch)`,
-        ps.x + 15,
-        ps.y + 3
-      );
     }
 
-    // Scale Bar + N/E Compass
-    const barArcsec = fovArcsec >= 120 ? 30 : fovArcsec >= 50 ? 15 : 5;
-    const barPx = barArcsec * pxPerArcsec;
-    const barX = 16;
-    const barY = cssHeight - 18;
-    ctx.strokeStyle = overlayAccent;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(barX, barY);
-    ctx.lineTo(barX + barPx, barY);
-    ctx.moveTo(barX, barY - 3);
-    ctx.lineTo(barX, barY + 3);
-    ctx.moveTo(barX + barPx, barY - 3);
-    ctx.lineTo(barX + barPx, barY + 3);
-    ctx.stroke();
+    if (!fullViewport) {
+      const barArcsec =
+        fovArcsec >= 1800
+          ? 600
+          : fovArcsec >= 600
+          ? 120
+          : fovArcsec >= 240
+          ? 60
+          : fovArcsec >= 90
+          ? 30
+          : 15;
+      const barPx = barArcsec * pxPerArcsec;
+      const barX = 16;
+      const barY = cssHeight - 18;
+      ctx.strokeStyle = overlayAccent;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(barX, barY);
+      ctx.lineTo(barX + barPx, barY);
+      ctx.moveTo(barX, barY - 3);
+      ctx.lineTo(barX, barY + 3);
+      ctx.moveTo(barX + barPx, barY - 3);
+      ctx.lineTo(barX + barPx, barY + 3);
+      ctx.stroke();
 
-    ctx.font = "11px monospace";
-    ctx.fillStyle = overlayText;
-    ctx.fillText(`${barArcsec}"`, barX, barY - 7);
-    ctx.fillText("N ↑  E ←", cssWidth - 68, cssHeight - 14);
+      ctx.font = "11px monospace";
+      ctx.fillStyle = overlayText;
+      const barLabel =
+        barArcsec >= 60 ? `${barArcsec / 60}'` : `${barArcsec}"`;
+      ctx.fillText(barLabel, barX, barY - 7);
+    }
 
     ctx.restore();
   }, [
     activeFrame,
-    refFrame,
+    activeCutout,
+    refCutout,
+    coaddCutouts,
     activeTarget,
     centerRaDeg,
     centerDecDeg,
@@ -1287,7 +962,6 @@ export default function SkyVideoCanvas({
     showGrid,
     showTargetOverlay,
     showHistoricalCatalogOverlay,
-    stackByDetector,
     selectedSource,
     stretchGain,
     colormap,
@@ -1328,168 +1002,65 @@ export default function SkyVideoCanvas({
       coords.dDecArcsec - curTargetOffset.dDecArcsec
     );
 
-    if (distToTarget <= Math.max(4.5, fovArcsec * 0.08)) {
+    if (activeTarget && distToTarget <= Math.max(12, fovArcsec * 0.05)) {
+      const measured = activeCutout
+        ? measureApertureFlux(
+            activeCutout,
+            coords.dRaArcsec,
+            coords.dDecArcsec,
+            centerRaDeg,
+            centerDecDeg
+          )
+        : null;
       onSelectSkySource({
-        id: activeTarget?.id ?? "primary-center",
-        label: activeTarget?.name ?? "Objeto central SPHEREx",
+        id: activeTarget.id,
+        label: activeTarget.name,
         raDeg: centerRaDeg,
         decDeg: centerDecDeg,
         dRaArcsec: curTargetOffset.dRaArcsec,
         dDecArcsec: curTargetOffset.dDecArcsec,
         isPrimaryTarget: true,
         spectralSlope: 0,
-        baseFlux: 2.8,
-        spectralType: activeTarget?.categoryLabel ?? "Fuente puntual IR",
+        baseFlux: measured ? Math.max(0.4, measured.excessFlux) : 2.8,
+        spectralType: activeTarget.categoryLabel,
       });
       return;
     }
 
-    const stars = generateBackgroundStars(centerRaDeg, centerDecDeg);
-    let bestStar: BackgroundStar | null = null;
-    let bestDist = Infinity;
+    if (!activeCutout) return;
 
-    for (const st of stars) {
-      const d = Math.hypot(
-        coords.dRaArcsec - st.dRaArcsec,
-        coords.dDecArcsec - st.dDecArcsec
-      );
-      if (d < bestDist) {
-        bestDist = d;
-        bestStar = st;
-      }
-    }
-
-    if (bestStar && bestDist <= Math.max(5.5, fovArcsec * 0.09)) {
-      const cosDec = Math.max(0.1, Math.cos((centerDecDeg * Math.PI) / 180));
-      const stRa =
-        (((centerRaDeg + bestStar.dRaArcsec / (3600 * cosDec)) % 360) + 360) %
-        360;
-      const stDec = Math.max(
-        -90,
-        Math.min(90, centerDecDeg + bestStar.dDecArcsec / 3600)
-      );
-      onSelectSkySource({
-        id: bestStar.id,
-        label: `Estrella de campo ${bestStar.id}`,
-        raDeg: stRa,
-        decDeg: stDec,
-        dRaArcsec: bestStar.dRaArcsec,
-        dDecArcsec: bestStar.dDecArcsec,
-        isPrimaryTarget: false,
-        spectralSlope: bestStar.spectralSlope,
-        baseFlux: bestStar.baseFlux,
-        spectralType:
-          bestStar.spectralSlope > 0.1
-            ? "Enana M / Fuente fría IR"
-            : "Estrella de secuencia principal G/K",
-      });
-    } else {
-      onSelectSkySource({
-        id: `APERTURE-${coords.raDeg.toFixed(4)}`,
-        label: `Apertura (${coords.raDeg.toFixed(4)}°, ${coords.decDeg.toFixed(
-          4
-        )}°)`,
-        raDeg: coords.raDeg,
-        decDeg: coords.decDeg,
-        dRaArcsec: coords.dRaArcsec,
-        dDecArcsec: coords.dDecArcsec,
-        isPrimaryTarget: false,
-        spectralSlope: -0.1,
-        baseFlux: 0.9,
-        spectralType: "Apertura fotométrica del cielo",
-      });
-    }
-  }
-
-  if (view360 && activeFrame) {
-    return (
-      <div className={fullViewport ? "h-full w-full" : "space-y-2"}>
-        <div
-          className={
-            fullViewport
-              ? "relative h-[calc(100vh-53px)] w-full cursor-grab overflow-hidden select-none active:cursor-grabbing"
-              : "relative h-[420px] w-full cursor-grab overflow-hidden rounded-lg border border-black/[.08] select-none active:cursor-grabbing sm:h-[480px] dark:border-white/[.145]"
-          }
-          onPointerDown={(e) => {
-            rotDragRef.current = {
-              active: true,
-              startX: e.clientX,
-              startY: e.clientY,
-              startYaw: rot360.yaw,
-              startPitch: rot360.pitch,
-            };
-          }}
-          onPointerMove={(e) => {
-            if (!rotDragRef.current.active) return;
-            const dx = e.clientX - rotDragRef.current.startX;
-            const dy = e.clientY - rotDragRef.current.startY;
-            setRot360({
-              yaw: (rotDragRef.current.startYaw - dx * 0.28 + 360) % 360,
-              pitch: Math.max(
-                -85,
-                Math.min(85, rotDragRef.current.startPitch + dy * 0.25)
-              ),
-            });
-          }}
-          onPointerUp={() => {
-            rotDragRef.current.active = false;
-          }}
-          onPointerLeave={() => {
-            rotDragRef.current.active = false;
-          }}
-          onWheel={(e) => {
-            e.preventDefault();
-            const factor = e.deltaY > 0 ? 1.15 : 0.87;
-            const next = Math.round(
-              Math.min(240, Math.max(15, fovArcsec * factor))
-            );
-            onZoomChange(next);
-          }}
-        >
-          <Canvas
-            camera={{ position: [0, 0, 0.01], fov: 55, near: 0.1, far: 250 }}
-          >
-            <SkySphere360Scene
-              centerRaDeg={centerRaDeg}
-              centerDecDeg={centerDecDeg}
-              frames={frames}
-              activeFrame={activeFrame}
-              midYears={midYears}
-              activeTarget={activeTarget}
-              fovArcsec={fovArcsec}
-              stretchGain={stretchGain}
-              colormap={colormap}
-              showGrid={showGrid}
-              showTargetOverlay={showTargetOverlay}
-              showHistoricalCatalogOverlay={showHistoricalCatalogOverlay}
-              yawDeg={rot360.yaw}
-              pitchDeg={rot360.pitch}
-              onSelectSkySource={onSelectSkySource}
-            />
-          </Canvas>
-
-          {/* HUD minimalista de orientación 360° */}
-          <div className="pointer-events-none absolute left-4 top-4 z-10 flex flex-wrap items-center gap-2">
-            <span className="rounded-full border border-black/[.12] bg-background/85 px-3 py-1 font-mono text-xs font-medium shadow-sm backdrop-blur-md dark:border-white/[.18]">
-              {activeTarget?.name ?? "Cielo 360°"} · {activeFrame.epochDate} ·
-              Giro 360° ({Math.round(rot360.yaw)}°,{" "}
-              {rot360.pitch >= 0 ? `+${Math.round(rot360.pitch)}` : Math.round(rot360.pitch)}
-              °)
-            </span>
-            {(Math.abs(rot360.yaw) > 1 || Math.abs(rot360.pitch) > 1) && (
-              <button
-                type="button"
-                onClick={() => setRot360({ yaw: 0, pitch: 0 })}
-                className="pointer-events-auto cursor-pointer rounded-full border border-black/[.12] bg-background/90 px-3 py-1 text-xs font-medium shadow-sm backdrop-blur-md transition-colors hover:bg-[#f2f2f2] dark:border-white/[.18] dark:hover:bg-[#1a1a1a]"
-              >
-                Centrar 360°
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
+    const aperture = measureApertureFlux(
+      activeCutout,
+      coords.dRaArcsec,
+      coords.dDecArcsec,
+      centerRaDeg,
+      centerDecDeg
     );
+
+    onSelectSkySource({
+      id: `fits-src-${Math.round(aperture.raDeg * 10000)}-${Math.round(
+        aperture.decDeg * 10000
+      )}`,
+      label: aperture.isRealSource
+        ? `Fuente FITS (${aperture.fluxPeak.toFixed(2)} ${activeCutout.unidad})`
+        : `Píxel FITS (${aperture.fluxPeak.toFixed(2)} ${activeCutout.unidad})`,
+      raDeg: aperture.raDeg,
+      decDeg: aperture.decDeg,
+      dRaArcsec: coords.dRaArcsec,
+      dDecArcsec: coords.dDecArcsec,
+      isPrimaryTarget: false,
+      spectralSlope: 0,
+      baseFlux: Math.max(0.2, aperture.excessFlux),
+      spectralType: aperture.isRealSource
+        ? `Fuente real en FITS (${activeCutout.unidad})`
+        : `Fondo infrarrojo FITS (${activeCutout.unidad})`,
+    });
   }
+
+  const handleRetryCutout = () => {
+    setFrameErrors({});
+    setReloadNonce((n) => n + 1);
+  };
 
   return (
     <div className={fullViewport ? "h-full w-full" : "space-y-2"}>
@@ -1556,35 +1127,68 @@ export default function SkyVideoCanvas({
             e.preventDefault();
             const factor = e.deltaY > 0 ? 1.15 : 0.87;
             const next = Math.round(
-              Math.min(240, Math.max(15, fovArcsec * factor))
+              Math.min(MAX_FOV_ARCSEC, Math.max(MIN_FOV_ARCSEC, fovArcsec * factor))
             );
             onZoomChange(next);
           }}
         />
+
+        {!activeCutout && !activeError && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <div className="inline-flex items-center gap-2 rounded-full border border-black/[.08] bg-background/90 px-3.5 py-1.5 text-xs font-medium shadow-sm backdrop-blur-md dark:border-white/[.145]">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Extrayendo píxeles reales del FITS…
+            </div>
+          </div>
+        )}
+
+        {!activeCutout && activeError && (
+          <div className="absolute inset-0 flex items-center justify-center p-4">
+            <div className="flex max-w-sm flex-col items-center gap-2 rounded-2xl border border-red-500/30 bg-background/95 p-4 text-center text-xs shadow-sm backdrop-blur-md">
+              <AlertCircle className="h-4 w-4 text-red-500" />
+              <p className="text-foreground/85">{activeError}</p>
+              <button
+                type="button"
+                onClick={handleRetryCutout}
+                className="inline-flex items-center gap-1.5 rounded-full bg-foreground px-3 py-1 text-xs font-medium text-background"
+              >
+                <RefreshCw className="h-3 w-3" />
+                Reintentar FITS
+              </button>
+            </div>
+          </div>
+        )}
+
+        {activeCutout && !activeCutout.coberturaWcs && (
+          <div className="pointer-events-none absolute left-3 top-3 z-10">
+            <span className="inline-flex items-center rounded-full border border-black/[.08] bg-background/90 px-2.5 py-1 text-[11px] font-medium text-foreground/80 shadow-sm backdrop-blur-md dark:border-white/[.145]">
+              FITS de referencia sin solapamiento WCS exacto · mostrando cuadro completo
+            </span>
+          </div>
+        )}
       </div>
 
-      {!fullViewport && (
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-foreground/70 font-mono">
-          <span>
-            {cursorSky
-              ? `Cursor: ${formatRAHMS(cursorSky.raDeg)}  ${formatDecDMS(
-                  cursorSky.decDeg
-                )} (${cursorSky.raDeg.toFixed(5)}°, ${cursorSky.decDeg.toFixed(
-                  5
-                )}°) · Clic en estrella = ver espectro 102 bandas`
-              : "Haz clic en una estrella para graficar su espectro IR · Arrastra para mover · Flechas ←/→ para épocas"}
-          </span>
-          {(panArcsec.ra !== 0 || panArcsec.dec !== 0) && (
-            <button
-              type="button"
-              onClick={() => setPanArcsec({ ra: 0, dec: 0 })}
-              className="rounded-full border border-black/[.08] px-2.5 py-0.5 text-xs font-sans hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
-            >
-              Centrar vista
-            </button>
-          )}
-        </div>
-      )}
+      {!fullViewport &&
+        (cursorSky || panArcsec.ra !== 0 || panArcsec.dec !== 0) && (
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-foreground/70 font-mono">
+            <span>
+              {cursorSky
+                ? `${formatRAHMS(cursorSky.raDeg)}  ${formatDecDMS(
+                    cursorSky.decDeg
+                  )}`
+                : ""}
+            </span>
+            {(panArcsec.ra !== 0 || panArcsec.dec !== 0) && (
+              <button
+                type="button"
+                onClick={() => setPanArcsec({ ra: 0, dec: 0 })}
+                className="rounded-full border border-black/[.08] px-2.5 py-0.5 text-xs font-sans hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
+              >
+                Centrar vista
+              </button>
+            )}
+          </div>
+        )}
     </div>
   );
 }

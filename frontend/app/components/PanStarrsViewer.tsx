@@ -3,6 +3,7 @@
 import { Download, ExternalLink, Image as ImageIcon, RefreshCw } from "lucide-react";
 import Image from "next/image";
 import { useCallback, useEffect, useState } from "react";
+import { apiUrl } from "@/lib/api-config";
 
 interface PanStarrsBandItem {
   projcell: string;
@@ -61,7 +62,9 @@ export default function PanStarrsViewer({
           fov_arcsec: String(fovArcsec),
           type: nextType,
         });
-        const res = await fetch(`/api/v1/observaciones/panstarrs?${params.toString()}`);
+        const res = await fetch(
+          apiUrl(`/api/v1/observaciones/panstarrs?${params.toString()}`)
+        );
         const payload = await res.json();
         if (!res.ok) {
           throw new Error(payload?.detail || `HTTP ${res.status}`);
@@ -91,7 +94,9 @@ export default function PanStarrsViewer({
           fov_arcsec: String(fovArcsec),
           type: fileType,
         });
-        const res = await fetch(`/api/v1/observaciones/panstarrs?${params.toString()}`);
+        const res = await fetch(
+          apiUrl(`/api/v1/observaciones/panstarrs?${params.toString()}`)
+        );
         const payload = await res.json();
         if (!res.ok) {
           throw new Error(payload?.detail || `HTTP ${res.status}`);
@@ -131,22 +136,19 @@ export default function PanStarrsViewer({
 
   const mainLabel =
     selectedKey === "color" && data?.colorUrl
-      ? `stack ${data.items[0]?.projcell ?? ""}.${data.items[0]?.subcell ?? ""} y/i/g (Color RGB)`
+      ? "Color RGB (y/i/g)"
       : activeItem
-      ? `${activeItem.type} ${activeItem.projcell}.${activeItem.subcell} · filtro ${activeItem.filter}`
-      : "Pan-STARRS1 Cutout";
+      ? `Filtro ${activeItem.filter}`
+      : "Pan-STARRS1";
 
   return (
     <div className="space-y-4 rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h3 className="text-sm font-semibold">
-            Pan-STARRS1 Image Access (DR2 / Stack &amp; Warp FITS)
-          </h3>
-          <p className="font-mono text-xs text-foreground/65">
-            ra = {ra.toFixed(6)}, dec = {dec.toFixed(6)} · tamaño ={" "}
-            {data?.sizePx ?? Math.round(fovArcsec / 0.25)} px ({fovArcsec.toFixed(2)}&quot;)
-          </p>
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold">Pan-STARRS1</h3>
+          <span className="font-mono text-xs text-foreground/60">
+            {ra.toFixed(4)}°, {dec.toFixed(4)}°
+          </span>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -163,7 +165,7 @@ export default function PanStarrsViewer({
                   : "text-foreground/75 hover:text-foreground"
               }`}
             >
-              Stack (Coadd)
+              Stack
             </button>
             <button
               type="button"
@@ -177,7 +179,7 @@ export default function PanStarrsViewer({
                   : "text-foreground/75 hover:text-foreground"
               }`}
             >
-              Warp (Épocas)
+              Warp
             </button>
           </div>
 
@@ -185,10 +187,11 @@ export default function PanStarrsViewer({
             type="button"
             onClick={() => fetchPanStarrs(fileType)}
             disabled={isRefreshing}
+            title="Actualizar"
+            aria-label="Actualizar"
             className="inline-flex h-8 items-center justify-center gap-1 rounded-full border border-black/[.08] px-3 text-xs font-medium transition-colors hover:bg-[#f2f2f2] disabled:opacity-50 dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${isRefreshing ? "animate-spin" : ""}`} />
-            <span>Actualizar</span>
           </button>
 
           {data?.ps1CutoutsWebUrl && (
@@ -198,7 +201,7 @@ export default function PanStarrsViewer({
               rel="noreferrer"
               className="inline-flex h-8 items-center justify-center gap-1 rounded-full border border-black/[.08] px-3 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
             >
-              <span>Abrir en ps1images.stsci.edu</span>
+              <span>STScI</span>
               <ExternalLink className="h-3 w-3" />
             </a>
           )}
@@ -283,31 +286,20 @@ export default function PanStarrsViewer({
             </div>
           </div>
 
-          {/* Tira de tarjetas Color y bandas g, r, i, z, y con enlaces Display / FITS / FITS-cutout */}
+          {/* Tira de tarjetas Color y bandas g, r, i, z, y */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
             {data?.colorUrl && (
               <div
                 onClick={() => setSelectedKey("color")}
-                className={`cursor-pointer rounded-lg border p-2 transition-colors ${
+                className={`relative cursor-pointer overflow-hidden rounded-lg border p-1.5 transition-colors ${
                   selectedKey === "color"
                     ? "border-foreground bg-black/[.04] dark:bg-white/[.08]"
                     : "border-black/[.08] hover:bg-black/[.02] dark:border-white/[.145] dark:hover:bg-white/[.04]"
                 }`}
               >
-                <div className="mb-1.5 text-center text-[11px] font-semibold">
-                  <div>
-                    {fileType} {data.items[0]?.projcell}.{data.items[0]?.subcell} y/i/g
-                  </div>
-                  <a
-                    href={data.colorUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                    className="font-normal text-blue-600 underline dark:text-blue-400"
-                  >
-                    Display
-                  </a>
-                </div>
+                <span className="absolute left-2.5 top-2.5 rounded-full bg-black/70 px-2 py-0.5 font-mono text-[10px] font-medium text-white">
+                  RGB
+                </span>
                 <Image
                   src={data.colorUrl}
                   alt="Pan-STARRS1 Color y/i/g"
@@ -326,46 +318,15 @@ export default function PanStarrsViewer({
                 <div
                   key={`${item.filename}-${idx}`}
                   onClick={() => setSelectedKey(key)}
-                  className={`cursor-pointer rounded-lg border p-2 transition-colors ${
+                  className={`relative cursor-pointer overflow-hidden rounded-lg border p-1.5 transition-colors ${
                     isSelected
                       ? "border-foreground bg-black/[.04] dark:bg-white/[.08]"
                       : "border-black/[.08] hover:bg-black/[.02] dark:border-white/[.145] dark:hover:bg-white/[.04]"
                   }`}
                 >
-                  <div className="mb-1.5 text-center text-[11px]">
-                    <div className="font-semibold">
-                      {item.type} {item.projcell}.{item.subcell} {item.filter}
-                    </div>
-                    <div className="flex flex-wrap items-center justify-center gap-1.5 text-blue-600 dark:text-blue-400">
-                      <a
-                        href={item.imageUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="underline"
-                      >
-                        Display
-                      </a>
-                      <a
-                        href={item.fitsUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="underline"
-                      >
-                        FITS
-                      </a>
-                      <a
-                        href={item.fitsCutoutUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="underline"
-                      >
-                        FITS-cutout
-                      </a>
-                    </div>
-                  </div>
+                  <span className="absolute left-2.5 top-2.5 rounded-full bg-black/70 px-2 py-0.5 font-mono text-[10px] font-medium text-white">
+                    {item.filter}
+                  </span>
                   <Image
                     src={item.imageUrl}
                     alt={`Pan-STARRS1 ${item.filter}`}

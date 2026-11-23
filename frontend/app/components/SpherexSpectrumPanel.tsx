@@ -2,7 +2,7 @@
 
 import { Layers, Sparkles, Waves } from "lucide-react";
 import { useMemo, useState } from "react";
-import { ChallengeTarget, formatDecDMS, formatRAHMS, Observacion } from "../astronomy";
+import { ChallengeTarget, Observacion } from "../astronomy";
 
 export interface SelectedSkySource {
   id: string;
@@ -287,25 +287,13 @@ export default function SpherexSpectrumPanel({
 
   return (
     <section className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Waves className="h-4 w-4 text-foreground/80" />
-            <h2 className="text-sm font-semibold">
-              Agrupación por detectores (D1–D6) y espectro infrarrojo SPHEREx (102 canales LVF)
-            </h2>
-            <span className="rounded-full border border-black/[.08] bg-black/[.04] px-2.5 py-0.5 font-mono text-[11px] dark:border-white/[.145] dark:bg-white/[.06]">
-              0.75 – 5.00 µm
-            </span>
-          </div>
-          <p className="mt-1 text-xs text-foreground/70">
-            Fuente seleccionada en el visor:{" "}
-            <strong className="font-medium text-foreground">
-              {selectedSource.label}
-            </strong>{" "}
-            ({formatRAHMS(selectedSource.raDeg)}, {formatDecDMS(selectedSource.decDeg)} ·{" "}
-            {selectedSource.spectralType}). Haz clic sobre cualquier estrella en el visor para medir su espectro.
-          </p>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Waves className="h-4 w-4 text-foreground/80" />
+          <h2 className="text-sm font-semibold">Espectro SPHEREx</h2>
+          <span className="rounded-full border border-black/[.08] bg-black/[.04] px-2.5 py-0.5 font-mono text-[11px] dark:border-white/[.145] dark:bg-white/[.06]">
+            {selectedSource.label}
+          </span>
         </div>
 
         {/* Botón de Apilado / Coadd por detector */}
@@ -319,11 +307,7 @@ export default function SpherexSpectrumPanel({
           }`}
         >
           <Layers className="h-3.5 w-3.5" />
-          <span>
-            {stackByDetector
-              ? "Apilado por detector activo (SNR mejorado ×√N)"
-              : "Apilar exposiciones por detector (Mejorar nitidez)"}
-          </span>
+          <span>{stackByDetector ? "Apilado activo" : "Apilar D1–D6"}</span>
         </button>
       </div>
 
@@ -338,7 +322,7 @@ export default function SpherexSpectrumPanel({
               : "border border-black/[.08] hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
           }`}
         >
-          <span>6 Detectores (102 bandas)</span>
+          <span>Todos</span>
         </button>
         {SPHEREX_DETECTORS.map((det) => {
           const isSelected = selectedBandFilter.includes(det.code);
@@ -347,6 +331,7 @@ export default function SpherexSpectrumPanel({
             <button
               key={det.code}
               type="button"
+              title={`${det.code} (${det.minUm}–${det.maxUm} µm) · ${count} exp`}
               onClick={() =>
                 onSelectBandFilter(isSelected ? "Todas" : det.name)
               }
@@ -360,12 +345,7 @@ export default function SpherexSpectrumPanel({
                 className="h-2 w-2 rounded-full"
                 style={{ backgroundColor: det.color }}
               />
-              <span>
-                {det.code} ({det.minUm}–{det.maxUm} µm)
-              </span>
-              <span className="font-mono text-[10px] opacity-75">
-                · {count} exp
-              </span>
+              <span>{det.code}</span>
             </button>
           );
         })}
@@ -405,7 +385,7 @@ export default function SpherexSpectrumPanel({
                   fontFamily="monospace"
                   fontWeight="bold"
                 >
-                  {det.code} (R={det.resolvingPower})
+                  {det.code}
                 </text>
               </g>
             );
@@ -430,7 +410,7 @@ export default function SpherexSpectrumPanel({
           />
 
           {/* Marcas de longitud de onda (µm) */}
-          {[0.75, 1.1, 1.63, 2.42, 3.83, 4.42, 5.0].map((tick) => {
+          {[0.75, 1.5, 2.5, 3.8, 5.0].map((tick) => {
             const x = wlToX(tick);
             return (
               <g key={tick}>
@@ -452,7 +432,7 @@ export default function SpherexSpectrumPanel({
                   fontSize="10"
                   fontFamily="monospace"
                 >
-                  {tick.toFixed(2)} µm
+                  {tick} µm
                 </text>
               </g>
             );
@@ -469,7 +449,7 @@ export default function SpherexSpectrumPanel({
             fontSize="10"
             fontFamily="monospace"
           >
-            Flujo (MJy/sr)
+            MJy/sr
           </text>
 
           {/* Curva espectral continua */}
@@ -505,21 +485,13 @@ export default function SpherexSpectrumPanel({
 
         {/* Telemetría del canal espectral bajo el cursor */}
         {activePoint && (
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-black/[.08] pt-2 text-xs font-mono dark:border-white/[.145]">
-            <div className="flex flex-wrap items-center gap-3">
-              <span className="inline-flex items-center gap-1.5 font-semibold">
-                <Sparkles className="h-3.5 w-3.5" />
-                Canal #{activePoint.channelIndex}/102 ({activePoint.detector.code})
-              </span>
-              <span>
-                λ = {activePoint.wavelengthUm.toFixed(3)} µm (Δλ ={" "}
-                {activePoint.bandwidthUm.toFixed(3)} µm)
-              </span>
-              <span>Flujo = {activePoint.fluxMjySr.toFixed(3)} MJy/sr</span>
-            </div>
-            <span className="font-sans text-foreground/70">
-              {activePoint.detector.features}
+          <div className="mt-2 flex flex-wrap items-center gap-3 border-t border-black/[.08] pt-2 text-xs font-mono dark:border-white/[.145]">
+            <span className="inline-flex items-center gap-1.5 font-semibold">
+              <Sparkles className="h-3.5 w-3.5" />
+              #{activePoint.channelIndex}/102 · {activePoint.detector.code}
             </span>
+            <span>λ {activePoint.wavelengthUm.toFixed(2)} µm</span>
+            <span>{activePoint.fluxMjySr.toFixed(2)} MJy/sr</span>
           </div>
         )}
       </div>

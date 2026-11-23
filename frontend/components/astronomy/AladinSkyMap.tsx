@@ -14,6 +14,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { withBasePath } from "@/lib/api-config";
 import {
   ChallengeTarget,
   EpochFrame,
@@ -144,7 +145,7 @@ export function ensureAladinScriptLoaded(): Promise<void> {
     }
 
     const script = document.createElement("script");
-    script.src = "/aladin.js";
+    script.src = withBasePath("/aladin.js");
     script.async = true;
     script.dataset.aladinLite = "true";
     script.onload = () => resolve();
@@ -165,7 +166,7 @@ function resolveSingleExtensionFitsUrl(fitsUrl: string): string {
     fitsUrl.includes("2025W18_1B_0074") ||
     fitsUrl.includes("l2b-v27-2026-196")
   ) {
-    return "/processed/2025W41_2B_0509_2_D1_aladin_fast.fits";
+    return withBasePath("/processed/2025W41_2B_0509_2_D1_aladin_fast.fits");
   }
   return fitsUrl;
 }
@@ -199,19 +200,17 @@ export default function AladinSkyMap({
   const allwiseCatalogRef = useRef<AladinCatalog | null>(null);
   const initializedRef = useRef(false);
 
-  const [status, setStatus] = useState(
-    "Inicializando motor astronómico Aladin Lite v3…"
-  );
+  const [errorStatus, setErrorStatus] = useState<string | null>(null);
   const [selectedSurveyId, setSelectedSurveyId] = useState(HIPS_SURVEYS[0].id);
   const [catalogCollapsed, setCatalogCollapsed] = useState(false);
 
   // Estado de catálogos superpuestos (Gaia DR3, AllWISE, SIMBAD)
   const [simbadEnabled, setSimbadEnabled] = useState(false);
-  const [simbadStatus, setSimbadStatus] = useState("Off");
+  const [simbadStatus, setSimbadStatus] = useState("");
   const [gaiaEnabled, setGaiaEnabled] = useState(false);
-  const [gaiaStatus, setGaiaStatus] = useState("Off");
+  const [gaiaStatus, setGaiaStatus] = useState("");
   const [allwiseCatEnabled, setAllwiseCatEnabled] = useState(false);
-  const [allwiseCatStatus, setAllwiseCatStatus] = useState("Off");
+  const [allwiseCatStatus, setAllwiseCatStatus] = useState("");
 
   // Estado del Blink Comparator en Aladin Lite (AllWISE 2010 ↔ SPHEREx 2026)
   const [spherexFitsLoaded, setSpherexFitsLoaded] = useState(false);
@@ -240,13 +239,10 @@ export default function AladinSkyMap({
       )
     : 0;
 
-  const activeSurvey =
-    HIPS_SURVEYS.find((s) => s.id === selectedSurveyId) ?? HIPS_SURVEYS[0];
-
   const loadFits = useCallback(
     (aladin: AladinInstance, rawUrl: string, centerOnFits: boolean) => {
       const effectiveUrl = resolveSingleExtensionFitsUrl(rawUrl);
-      setStatus(`Cargando FITS científico (${effectiveUrl.split("/").pop()})…`);
+      setErrorStatus(null);
 
       try {
         aladin.displayFITS(
@@ -295,25 +291,15 @@ export default function AladinSkyMap({
             }
 
             setSpherexFitsLoaded(true);
-            setStatus(
-              `Observación SPHEREx posicionada · Vista conservada en RA ${ra.toFixed(
-                6
-              )}°, DEC ${dec.toFixed(6)}° (FOV ${fov.toFixed(4)}°)`
-            );
+            setErrorStatus(null);
           },
           (error) => {
             console.warn("Aviso al superponer capa FITS en Aladin:", error);
-            setStatus(
-              `Mapa HiPS activo en RA ${ra.toFixed(4)}°, DEC ${dec.toFixed(4)}°`
-            );
           },
           "spherex-frame"
         );
       } catch (err) {
         console.warn("Aviso en displayFITS:", err);
-        setStatus(
-          `Mapa HiPS activo en RA ${ra.toFixed(4)}°, DEC ${dec.toFixed(4)}°`
-        );
       }
     },
     [ra, dec, fov, fitsOpacity, syncAladinTelemetry]
@@ -489,11 +475,7 @@ export default function AladinSkyMap({
 
           aladinRef.current = aladin;
           syncAladinTelemetry(aladin);
-          setStatus(
-            `Aladin Lite v3 activo · AllWISE (2010) + SPHEREx · RA ${ra.toFixed(
-              6
-            )}°, DEC ${dec.toFixed(6)}° · FOV ${fov.toFixed(4)}°`
-          );
+          setErrorStatus(null);
 
           const is2025W41Target =
             Math.abs(ra - 123.67) < 1 && Math.abs(dec - 38.51) < 1;
@@ -505,7 +487,7 @@ export default function AladinSkyMap({
       .catch((err) => {
         initializedRef.current = false;
         console.error("Error inicializando Aladin Lite:", err);
-        setStatus("Error cargando la biblioteca Aladin Lite");
+        setErrorStatus("Error cargando Aladin Lite");
       });
 
     return () => {
@@ -518,24 +500,26 @@ export default function AladinSkyMap({
       aladinRef.current.gotoRaDec(ra, dec);
       aladinRef.current.setFoV(fov);
       syncAladinTelemetry(aladinRef.current);
-      setStatus(
-        `Aladin Lite v3 activo · RA ${ra.toFixed(6)}°, DEC ${dec.toFixed(
-          6
-        )}° · FOV ${fov.toFixed(4)}° (${(fov * 3600).toFixed(1)}")`
-      );
+      setErrorStatus(null);
     }
   }, [ra, dec, fov, syncAladinTelemetry]);
 
   return (
     <section className="w-full space-y-3">
-      {/* Barra superior de control Blink Comparator y Catálogos Históricos (AllWISE 2010 / Gaia DR3) */}
+      {/* Barra superior de control Blink Comparator */}
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-        <span className="font-mono text-foreground/80" role="status">
-          Estado: {status}
-          {frames.length > 0
-            ? ` · Época ${currentFrameIndex + 1}/${frames.length}`
-            : ""}
-        </span>
+        <div className="flex items-center gap-2">
+          {errorStatus && (
+            <span className="font-mono text-red-600 dark:text-red-400" role="status">
+              {errorStatus}
+            </span>
+          )}
+          {frames.length > 0 && (
+            <span className="font-mono text-foreground/70">
+              Época {currentFrameIndex + 1}/{frames.length}
+            </span>
+          )}
+        </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -551,14 +535,13 @@ export default function AladinSkyMap({
               <>
                 <Pause className="h-3.5 w-3.5" />
                 <span>
-                  Blink Activo:{" "}
-                  {blinkShowRecent ? "Época SPHEREx (2026)" : "AllWISE (2010)"}
+                  {blinkShowRecent ? "SPHEREx" : "AllWISE"}
                 </span>
               </>
             ) : (
               <>
                 <Play className="h-3.5 w-3.5" />
-                <span>Blink AllWISE (2010) ↔ SPHEREx (2026)</span>
+                <span>Blink</span>
               </>
             )}
           </button>
@@ -579,7 +562,7 @@ export default function AladinSkyMap({
             }`}
           >
             <Eye className="h-3.5 w-3.5" />
-            <span>Capa AllWISE (2010)</span>
+            <span>AllWISE</span>
           </button>
 
           <button
@@ -593,9 +576,7 @@ export default function AladinSkyMap({
             className="inline-flex h-8 items-center justify-center gap-1.5 rounded-full border border-black/[.08] px-3 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
           >
             <Compass className="h-3.5 w-3.5" />
-            <span>
-              Centrar ({ra.toFixed(2)}°, {dec.toFixed(2)}°)
-            </span>
+            <span>Centrar</span>
           </button>
 
           <button
@@ -608,21 +589,17 @@ export default function AladinSkyMap({
             className="inline-flex h-8 items-center justify-center gap-1.5 rounded-full bg-foreground px-3 text-xs font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
           >
             <Layers className="h-3.5 w-3.5" />
-            <span>
-              {spherexFitsLoaded
-                ? "Centrar en FITS SPHEREx"
-                : "Superponer FITS SPHEREx"}
-            </span>
+            <span>FITS SPHEREx</span>
           </button>
         </div>
       </div>
 
-      {/* Control de opacidad de superposición FITS y selector de épocas semestrales */}
+      {/* Control de opacidad de superposición FITS */}
       <div className="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-black/[.08] bg-black/[.02] px-3 py-2 text-xs dark:border-white/[.145] dark:bg-white/[.02]">
         <div className="flex flex-wrap items-center gap-3">
           <span className="inline-flex items-center gap-1.5 font-medium">
             <Film className="h-3.5 w-3.5" />
-            <span>Opacidad capa SPHEREx sobre {activeSurvey.name}:</span>
+            <span>Opacidad FITS</span>
           </span>
           <input
             type="range"
@@ -647,10 +624,7 @@ export default function AladinSkyMap({
         {matchedTarget && wiseJumpArcsec > 0.5 && (
           <div className="flex items-center gap-1.5 font-mono text-[11px] text-amber-600 dark:text-amber-400">
             <Sparkles className="h-3.5 w-3.5 shrink-0" />
-            <span>
-              Salto desde AllWISE (2010) → SPHEREx (2026): Δθ ={" "}
-              {wiseJumpArcsec.toFixed(1)}&quot; ({matchedTarget.name})
-            </span>
+            <span>Δθ = {wiseJumpArcsec.toFixed(1)}&quot;</span>
           </div>
         )}
       </div>
@@ -663,10 +637,10 @@ export default function AladinSkyMap({
           style={{ height: "620px" }}
         />
 
-        {/* Barra inferior de atribución y selector HiPS */}
+        {/* Selector HiPS */}
         <div
           aria-live="polite"
-          className="pointer-events-auto absolute bottom-2 left-1/2 z-20 flex max-w-[calc(100%-9rem)] -translate-x-1/2 items-center gap-2 rounded border border-neutral-600 bg-neutral-950/90 px-2.5 py-1 text-[11px] text-neutral-100 shadow backdrop-blur"
+          className="pointer-events-auto absolute bottom-2 left-1/2 z-20 flex -translate-x-1/2 items-center rounded border border-neutral-600 bg-neutral-950/90 px-2.5 py-1 text-[11px] text-neutral-100 shadow backdrop-blur"
         >
           <select
             aria-label="Change HiPS"
@@ -690,9 +664,6 @@ export default function AladinSkyMap({
               </option>
             ))}
           </select>
-          <span className="hidden truncate text-neutral-400 sm:inline">
-            · {activeSurvey.copyright}
-          </span>
         </div>
 
         {/* Panel lateral derecho Catalogs (Gaia DR3 + AllWISE + SIMBAD + SPHEREx FITS) */}
@@ -720,7 +691,7 @@ export default function AladinSkyMap({
           {!catalogCollapsed && (
             <div className="flex flex-col gap-1.5 p-2">
               <h3 className="pr-5 text-[11px] font-bold leading-none">
-                Catálogos (Gaia / WISE)
+                Catálogos
               </h3>
 
               {/* Gaia DR3 */}
@@ -752,16 +723,18 @@ export default function AladinSkyMap({
                       }
                     } else {
                       gaiaCatalogRef.current?.hide();
-                      setGaiaStatus("Off");
+                      setGaiaStatus("");
                     }
                   }}
                   className="h-3 w-3 accent-cyan-500"
                 />
-                <span className="font-medium">Gaia DR3 (2016)</span>
+                <span className="font-medium">Gaia DR3</span>
               </label>
-              <span className="pl-5 text-[10px] text-neutral-400">
-                {gaiaStatus}
-              </span>
+              {gaiaStatus && (
+                <span className="pl-5 text-[10px] text-neutral-400">
+                  {gaiaStatus}
+                </span>
+              )}
 
               {/* AllWISE */}
               <label className="flex cursor-pointer items-center gap-1.5 pt-0.5">
@@ -792,16 +765,18 @@ export default function AladinSkyMap({
                       }
                     } else {
                       allwiseCatalogRef.current?.hide();
-                      setAllwiseCatStatus("Off");
+                      setAllwiseCatStatus("");
                     }
                   }}
                   className="h-3 w-3 accent-amber-500"
                 />
-                <span className="font-medium">AllWISE (2010)</span>
+                <span className="font-medium">AllWISE</span>
               </label>
-              <span className="pl-5 text-[10px] text-neutral-400">
-                {allwiseCatStatus}
-              </span>
+              {allwiseCatStatus && (
+                <span className="pl-5 text-[10px] text-neutral-400">
+                  {allwiseCatStatus}
+                </span>
+              )}
 
               {/* SIMBAD */}
               <label className="flex cursor-pointer items-center gap-1.5 pt-0.5">
@@ -826,16 +801,18 @@ export default function AladinSkyMap({
                       }
                     } else {
                       simbadCatalogRef.current?.hide();
-                      setSimbadStatus("Off");
+                      setSimbadStatus("");
                     }
                   }}
                   className="h-3 w-3 accent-sky-600"
                 />
                 <span className="font-medium">SIMBAD</span>
               </label>
-              <span className="pl-5 text-[10px] text-neutral-400">
-                {simbadStatus}
-              </span>
+              {simbadStatus && (
+                <span className="pl-5 text-[10px] text-neutral-400">
+                  {simbadStatus}
+                </span>
+              )}
 
               <button
                 type="button"

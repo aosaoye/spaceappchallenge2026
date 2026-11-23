@@ -1,3 +1,4 @@
+import { apiUrl } from "@/lib/api-config";
 import { parseSexagesimal } from "@/lib/astronomy/coordinates";
 
 export interface Observacion {
@@ -12,14 +13,56 @@ export interface Observacion {
   url_imagen_png?: string | null;
 }
 
+export const MIN_FOV_ARCSEC = 30;
+export const MAX_FOV_ARCSEC = 3600;
+export const DEFAULT_FOV_ARCSEC = 600;
+
+export interface FitsCutoutPayload {
+  identificador: string;
+  detector: number | string;
+  unidad: string;
+  ancho: number;
+  alto: number;
+  vmin: number;
+  vmax: number;
+  mediana: number;
+  ruido_mad: number;
+  ra_centro: number;
+  dec_centro: number;
+  fov_arcsec: number;
+  pixscale_arcsec: number;
+  cobertura_wcs: boolean;
+  pixeles_validos: number;
+  datos_f32_b64: string;
+}
+
+export function getFitsCutoutUrl(params: {
+  fitsUrl: string;
+  raDeg: number;
+  decDeg: number;
+  fovArcsec: number;
+  tamanoPx?: number;
+}): string {
+  const qs = new URLSearchParams({
+    fits_url: params.fitsUrl,
+    ra: params.raDeg.toFixed(6),
+    dec: params.decDeg.toFixed(6),
+    fov_arcsec: String(Math.round(params.fovArcsec)),
+    tamano_px: String(params.tamanoPx ?? 280),
+  });
+  return apiUrl(`/api/v1/observaciones/recorte-fits?${qs.toString()}`);
+}
+
 export function getFitsPngUrl(
   obs: Observacion,
   modo: "flujo" | "longitud_onda" = "flujo"
 ): string {
-  if (modo === "flujo" && obs.url_imagen_png) return obs.url_imagen_png;
-  return `/api/v1/observaciones/imagen?fits_url=${encodeURIComponent(
-    obs.url_acceso
-  )}&modo=${encodeURIComponent(modo)}`;
+  if (modo === "flujo" && obs.url_imagen_png) return apiUrl(obs.url_imagen_png);
+  return apiUrl(
+    `/api/v1/observaciones/imagen?fits_url=${encodeURIComponent(
+      obs.url_acceso
+    )}&modo=${encodeURIComponent(modo)}`
+  );
 }
 
 export interface ExtensionFitsInfo {
@@ -75,12 +118,69 @@ export interface MetadatosFitsResponse {
 
 export interface ObservacionesResponse {
   total: number;
+  fuente?: string;
   observaciones: Observacion[];
+}
+
+export async function fetchRegionObservationsData(
+  raDeg: number,
+  decDeg: number,
+  radiusArcsec: number
+): Promise<ObservacionesResponse> {
+  const params = new URLSearchParams({
+    ascension_recta: raDeg.toFixed(6),
+    declinacion: decDeg.toFixed(6),
+    radio: String(radiusArcsec),
+    respaldo_hips5: "true",
+  });
+
+  const primaryRes = await fetch(
+    apiUrl(`/api/v1/observaciones?${params.toString()}`)
+  );
+  if (primaryRes.ok) {
+    const data = (await primaryRes.json()) as ObservacionesResponse;
+    if (Array.isArray(data.observaciones) && data.observaciones.length > 0) {
+      return data;
+    }
+  }
+
+  const hipsParams = new URLSearchParams({
+    ascension_recta: raDeg.toFixed(6),
+    declinacion: decDeg.toFixed(6),
+  });
+  const hipsRes = await fetch(
+    apiUrl(`/api/v1/observaciones/hips5?${hipsParams.toString()}`)
+  );
+  if (hipsRes.ok) {
+    return (await hipsRes.json()) as ObservacionesResponse;
+  }
+
+  let errDetail = `HTTP ${primaryRes.status}`;
+  try {
+    const errJson = await primaryRes.json();
+    if (errJson?.detail) errDetail = String(errJson.detail);
+  } catch {
+    // mantener estado HTTP si la respuesta de error no es JSON
+  }
+  throw new Error(errDetail);
 }
 
 export interface EstadoBackend {
   estado: string;
   proyecto: string;
+}
+
+export interface ResolvedImageCoordsResponse {
+  metodo: "fits-wcs" | "astrometry.net";
+  ra_deg: number;
+  dec_deg: number;
+  fov_arcsec: number;
+  radio_sugerido_arcsec: number;
+  pixscale_arcsec: number | null;
+  orientacion_deg: number | null;
+  objeto_detectado: string | null;
+  objetos_en_campo: string[];
+  job_id: number | null;
 }
 
 export interface EpochFrame {

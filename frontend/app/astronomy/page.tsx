@@ -1,17 +1,20 @@
 "use client";
 
-import { ArrowLeft, Check, Download, Globe, Share2, Telescope } from "lucide-react";
+import { ArrowLeft, Check, Download, Film, Share2, Telescope } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { withBasePath } from "@/lib/api-config";
 import {
   buildEpochFrames,
   CHALLENGE_TARGETS,
+  fetchRegionObservationsData,
   findMatchingChallengeTarget,
   formatDecDMS,
   formatRAHMS,
+  MAX_FOV_ARCSEC,
+  MIN_FOV_ARCSEC,
   Observacion,
-  ObservacionesResponse,
 } from "@/app/astronomy";
 import CustomSelect from "@/app/components/CustomSelect";
 import SkyVideoCanvas from "@/app/components/SkyVideoCanvas";
@@ -28,21 +31,15 @@ export default function AstronomyPage() {
   const [fov, setFov] = useState(0.3);
   const [urlError, setUrlError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  const [mode360, setMode360] = useState<"r3f-360" | "aladin">("r3f-360");
+  const [viewerTab, setViewerTab] = useState<"fits" | "aladin">("fits");
   const [observations, setObservations] = useState<Observacion[]>([]);
 
   useEffect(() => {
     let cancelled = false;
     async function loadObs() {
       try {
-        const params = new URLSearchParams({
-          ascension_recta: ra.toFixed(6),
-          declinacion: dec.toFixed(6),
-          radio: "60",
-        });
-        const res = await fetch(`/api/v1/observaciones?${params.toString()}`);
-        if (res.ok && !cancelled) {
-          const data: ObservacionesResponse = await res.json();
+        const data = await fetchRegionObservationsData(ra, dec, 60);
+        if (!cancelled) {
           setObservations(Array.isArray(data.observaciones) ? data.observaciones : []);
         }
       } catch {
@@ -113,7 +110,7 @@ export default function AstronomyPage() {
         <div className="flex items-center gap-2">
           <Telescope className="h-4 w-4" />
           <span className="text-sm font-semibold tracking-tight">
-            SPHEREx Explorer · Aladin Lite v3
+            SPHEREx Explorer
           </span>
         </div>
 
@@ -126,12 +123,12 @@ export default function AstronomyPage() {
             {copied ? (
               <>
                 <Check className="h-3.5 w-3.5 text-emerald-500" />
-                <span>¡Enlace copiado!</span>
+                <span>Copiado</span>
               </>
             ) : (
               <>
                 <Share2 className="h-3.5 w-3.5" />
-                <span>Compartir URL (?ra=&amp;dec=&amp;fov=)</span>
+                <span>Compartir</span>
               </>
             )}
           </button>
@@ -144,7 +141,7 @@ export default function AstronomyPage() {
             className="inline-flex h-8 items-center justify-center gap-1.5 rounded-full border border-black/[.08] px-3 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            <span>Volver al explorador</span>
+            <span>Volver</span>
           </Link>
           <ThemeToggle />
         </nav>
@@ -155,12 +152,11 @@ export default function AstronomyPage() {
           role="alert"
           className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-xs text-red-600 dark:text-red-400"
         >
-          <strong>Error en los parámetros de la URL:</strong> {urlError}. Se
-          muestra la región de respaldo por defecto.
+          <strong>Error en URL:</strong> {urlError}
         </div>
       )}
 
-      {/* Selector de muestras (usando CustomSelect por herencia) y alternador 360° R3F / Aladin Lite */}
+      {/* Selector de muestras (usando CustomSelect por herencia) y alternador FITS SPHEREx / Aladin Lite */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="w-64">
           <CustomSelect
@@ -183,32 +179,32 @@ export default function AstronomyPage() {
         <div className="inline-flex items-center rounded-full border border-black/[.1] bg-black/[.03] p-0.5 dark:border-white/[.16] dark:bg-white/[.05]">
           <button
             type="button"
-            onClick={() => setMode360("r3f-360")}
+            onClick={() => setViewerTab("fits")}
             className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors ${
-              mode360 === "r3f-360"
+              viewerTab === "fits"
                 ? "bg-foreground text-background shadow-sm"
                 : "text-foreground/75 hover:text-foreground"
             }`}
           >
-            <Globe className="h-3.5 w-3.5" />
-            <span>Mapa del cielo 360° (React Three Fiber)</span>
+            <Film className="h-3.5 w-3.5" />
+            <span>FITS SPHEREx</span>
           </button>
           <button
             type="button"
-            onClick={() => setMode360("aladin")}
+            onClick={() => setViewerTab("aladin")}
             className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors ${
-              mode360 === "aladin"
+              viewerTab === "aladin"
                 ? "bg-foreground text-background shadow-sm"
                 : "text-foreground/75 hover:text-foreground"
             }`}
           >
             <Telescope className="h-3.5 w-3.5" />
-            <span>Aladin Lite v3</span>
+            <span>Aladin Lite</span>
           </button>
         </div>
       </div>
 
-      {mode360 === "r3f-360" ? (
+      {viewerTab === "fits" ? (
         <SkyVideoCanvas
           centerRaDeg={ra}
           centerDecDeg={dec}
@@ -216,7 +212,10 @@ export default function AstronomyPage() {
           currentFrameIndex={0}
           referenceFrameIndex={0}
           activeTarget={matchedTarget}
-          fovArcsec={Math.max(15, Math.min(240, Math.round(fov * 3600)))}
+          fovArcsec={Math.max(
+            MIN_FOV_ARCSEC,
+            Math.min(MAX_FOV_ARCSEC, Math.round(fov * 3600))
+          )}
           stretchGain={1.2}
           colormap="grayscale"
           playbackMode="ping-pong"
@@ -227,7 +226,6 @@ export default function AstronomyPage() {
           onZoomChange={(nextArcsec) =>
             setFov(Number((nextArcsec / 3600).toFixed(4)))
           }
-          view360
         />
       ) : (
         <AladinSkyMap
@@ -239,51 +237,24 @@ export default function AstronomyPage() {
         />
       )}
 
-      <section className="grid grid-cols-1 gap-6 rounded-xl border border-black/[.08] p-4 dark:border-white/[.145] lg:grid-cols-[1fr_360px]">
-        <div className="space-y-2">
-          <h2 className="text-base font-semibold">
-            Productos generados por process_spherex.py (Fase 3)
-          </h2>
-          <p className="text-xs text-foreground/70">
-            El procesador científico extrae la extensión{" "}
-            <code className="rounded bg-black/[.05] px-1 py-0.5 font-mono dark:bg-white/[.06]">
-              IMAGE
-            </code>{" "}
-            (2040 × 2040, flujo calibrado en MJy/sr) y el WCS espacial{" "}
-            <code className="rounded bg-black/[.05] px-1 py-0.5 font-mono dark:bg-white/[.06]">
-              WCS(header, relax=True).celestial
-            </code>{" "}
-            para producir dos archivos complementarios:
-          </p>
-          <ul className="list-disc space-y-1 pl-5 text-xs text-foreground/80 font-mono">
-            <li>processed/2025W41_2B_0509_2_D1_preview.png (AsinhStretch [1, 99.5])</li>
-            <li>processed/2025W41_2B_0509_2_D1_aladin_fast.fits (PrimaryHDU 2D + WCS celeste)</li>
-          </ul>
-          <div className="pt-2">
-            <a
-              href="/processed/2025W41_2B_0509_2_D1_aladin.fits"
-              download
-              className="inline-flex h-8 items-center justify-center gap-1.5 rounded-full border border-black/[.08] px-3 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
-            >
-              <Download className="h-3.5 w-3.5" />
-              <span>Descargar 2025W41_2B_0509_2_D1_aladin.fits</span>
-            </a>
-          </div>
-        </div>
+      <section className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-black/[.08] p-4 dark:border-white/[.145]">
+        <a
+          href={withBasePath("/processed/2025W41_2B_0509_2_D1_aladin.fits")}
+          download
+          className="inline-flex h-9 items-center justify-center gap-1.5 rounded-full border border-black/[.08] px-4 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
+        >
+          <Download className="h-3.5 w-3.5" />
+          <span>Descargar FITS</span>
+        </a>
 
-        <div className="flex flex-col items-center justify-center rounded-lg border border-black/[.08] p-2 dark:border-white/[.145]">
-          <Image
-            src="/spherex_D1_preview.png"
-            alt="Vista previa SPHEREx 2025W41_2B_0509_2 D1"
-            width={340}
-            height={340}
-            unoptimized
-            className="h-auto max-h-64 w-auto rounded object-contain"
-          />
-          <span className="mt-1 font-mono text-[11px] text-foreground/60">
-            2025W41_2B_0509_2_D1_preview.png
-          </span>
-        </div>
+        <Image
+          src="/spherex_D1_preview.png"
+          alt="SPHEREx D1"
+          width={160}
+          height={160}
+          unoptimized
+          className="h-24 w-24 rounded object-cover"
+        />
       </section>
     </main>
   );

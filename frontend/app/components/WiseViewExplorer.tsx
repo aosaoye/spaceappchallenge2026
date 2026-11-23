@@ -5,17 +5,16 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
-  Compass,
   ExternalLink,
   Film,
   FlaskConical,
   Globe,
   Image as ImageIcon,
+  ImagePlus,
   Layers,
   Pause,
   Play,
   RotateCcw,
-  Search,
   Share2,
   SkipBack,
   SkipForward,
@@ -32,23 +31,31 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import AladinSkyMap, {
   ensureAladinScriptLoaded,
 } from "@/components/astronomy/AladinSkyMap";
+import { withBasePath } from "@/lib/api-config";
+import { ChatVisorContext } from "@/lib/astronomy/chatbot-engine";
 import { tryParseViewParams } from "@/lib/astronomy/parse-view-params";
 import {
   buildEpochFrames,
   CHALLENGE_TARGETS,
   ChallengeTarget,
+  DEFAULT_FOV_ARCSEC,
+  fetchRegionObservationsData,
   findMatchingChallengeTarget,
   formatDecDMS,
   formatRAHMS,
   getFitsPngUrl,
+  MAX_FOV_ARCSEC,
+  MIN_FOV_ARCSEC,
   Observacion,
-  ObservacionesResponse,
   parseDeclination,
   parseRightAscension,
 } from "../astronomy";
+import AstronomyChatbot from "./AstronomyChatbot";
 import CustomSelect from "./CustomSelect";
-import FitsScientificInspector from "./FitsScientificInspector";
 import PanStarrsViewer from "./PanStarrsViewer";
+import SkyCoordinateSearch, {
+  SolvedSkyImageState,
+} from "./SkyCoordinateSearch";
 import SkyVideoCanvas, {
   ColormapMode,
   computeTargetFluxMultiplier,
@@ -66,6 +73,166 @@ function formatFileSize(bytes: number | null): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
+}
+
+function CustomSwitch({
+  checked,
+  onChange,
+  label,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  label: string;
+}) {
+  return (
+    <label className="group flex cursor-pointer items-center justify-between gap-3 py-0.5 select-none">
+      <span>{label}</span>
+      <span className="relative inline-flex shrink-0 items-center">
+        <input
+          type="checkbox"
+          role="switch"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          className="peer sr-only"
+        />
+        <span
+          aria-hidden="true"
+          className={`inline-flex h-6 w-[42px] items-center rounded-full border-2 transition-all duration-200 peer-focus-visible:ring-2 peer-focus-visible:ring-foreground/20 ${
+            checked
+              ? "border-transparent bg-foreground group-hover:bg-[#383838] dark:group-hover:bg-[#ccc]"
+              : "border-black/[.22] bg-background group-hover:bg-[#f2f2f2] dark:border-white/[.25] dark:group-hover:bg-[#1a1a1a]"
+          }`}
+        >
+          <span
+            className={`rounded-full transition-all duration-200 ${
+              checked
+                ? "h-4 w-4 translate-x-[20px] bg-background"
+                : "h-3 w-3 translate-x-[3px] bg-foreground/45 group-hover:bg-foreground/70"
+            }`}
+          />
+        </span>
+      </span>
+    </label>
+  );
+}
+
+function clampFovArcsec(value: number): number {
+  return Math.max(MIN_FOV_ARCSEC, Math.min(MAX_FOV_ARCSEC, Math.round(value)));
+}
+
+function fovToSliderValue(fovArcsec: number): number {
+  const clamped = clampFovArcsec(fovArcsec);
+  const ratio =
+    Math.log(clamped / MIN_FOV_ARCSEC) /
+    Math.log(MAX_FOV_ARCSEC / MIN_FOV_ARCSEC);
+  return Math.round((1 - ratio) * 100);
+}
+
+function sliderValueToFov(sliderVal: number): number {
+  const t = Math.max(0, Math.min(100, sliderVal)) / 100;
+  return clampFovArcsec(
+    MIN_FOV_ARCSEC * Math.pow(MAX_FOV_ARCSEC / MIN_FOV_ARCSEC, 1 - t)
+  );
+}
+
+function formatFovLabel(fovArcsec: number): string {
+  return fovArcsec >= 120
+    ? `${(fovArcsec / 60).toFixed(1)}'`
+    : `${fovArcsec}"`;
+}
+
+function ZoomSliderField({
+  inputId,
+  fovArcsec,
+  onChange,
+}: {
+  inputId: string;
+  fovArcsec: number;
+  onChange: (nextFovArcsec: number) => void;
+}) {
+  return (
+    <div>
+      <div className="flex items-center justify-between text-xs">
+        <label htmlFor={inputId} className="font-medium">
+          Zoom
+        </label>
+        <span className="font-mono text-foreground/70">
+          {(DEFAULT_FOV_ARCSEC / fovArcsec).toFixed(1)}× ({formatFovLabel(fovArcsec)})
+        </span>
+      </div>
+      <div className="mt-1.5 flex items-center gap-2">
+        <ZoomOut className="h-3.5 w-3.5 shrink-0 text-foreground/60" />
+        <input
+          id={inputId}
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={fovToSliderValue(fovArcsec)}
+          onChange={(e) => onChange(sliderValueToFov(Number.parseInt(e.target.value, 10)))}
+          className="w-full cursor-pointer accent-foreground"
+        />
+        <ZoomIn className="h-3.5 w-3.5 shrink-0 text-foreground/60" />
+      </div>
+    </div>
+  );
+}
+
+function FilterToggleList({
+  showCrosshair,
+  onToggleCrosshair,
+  showGrid,
+  onToggleGrid,
+  showTargetOverlay,
+  onToggleTargetOverlay,
+  showHistoricalCatalogOverlay,
+  onToggleHistoricalCatalogOverlay,
+  stackByDetector,
+  onToggleStackByDetector,
+}: {
+  showCrosshair: boolean;
+  onToggleCrosshair: (checked: boolean) => void;
+  showGrid: boolean;
+  onToggleGrid: (checked: boolean) => void;
+  showTargetOverlay: boolean;
+  onToggleTargetOverlay: (checked: boolean) => void;
+  showHistoricalCatalogOverlay: boolean;
+  onToggleHistoricalCatalogOverlay: (checked: boolean) => void;
+  stackByDetector: boolean;
+  onToggleStackByDetector: (checked: boolean) => void;
+}) {
+  const items = [
+    { label: "Retícula", checked: showCrosshair, onChange: onToggleCrosshair },
+    { label: "Rejilla WCS", checked: showGrid, onChange: onToggleGrid },
+    {
+      label: "Trayectoria",
+      checked: showTargetOverlay,
+      onChange: onToggleTargetOverlay,
+    },
+    {
+      label: "AllWISE / Gaia",
+      checked: showHistoricalCatalogOverlay,
+      onChange: onToggleHistoricalCatalogOverlay,
+    },
+    {
+      label: "Apilar D1–D6",
+      checked: stackByDetector,
+      onChange: onToggleStackByDetector,
+    },
+  ];
+
+  return (
+    <>
+      {items.map((item) => (
+        <CustomSwitch
+          key={item.label}
+          label={item.label}
+          checked={item.checked}
+          onChange={item.onChange}
+        />
+      ))}
+    </>
+  );
 }
 
 function FitsPngFrameView({
@@ -158,19 +325,14 @@ function FitsPngFrameView({
           />
         )}
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-foreground/70 font-mono">
-        <span>
-          {modoRender === "longitud_onda"
-            ? "Mapa WCS espectral key='W' (WCS-WAVE · sip=None · longitud de onda por píxel)"
-            : "Renderizado en backend: AsinhStretch · percentiles [1, 99.5] · MJy/sr"}
-        </span>
+      <div className="flex items-center justify-end text-xs text-foreground/70">
         <a
           href={currentSrc}
           target="_blank"
           rel="noreferrer"
-          className="inline-flex items-center gap-1 font-sans underline underline-offset-4 hover:opacity-75"
+          className="inline-flex items-center gap-1 underline underline-offset-4 hover:opacity-75"
         >
-          <span>Abrir PNG completo</span>
+          <span>Abrir PNG</span>
           <ExternalLink className="h-3 w-3" />
         </a>
       </div>
@@ -203,9 +365,7 @@ export default function WiseViewExplorer() {
 
   // Backend & observation state
   const [loading, setLoading] = useState(false);
-  const [statusMessage, setStatusMessage] = useState<string>(
-    "Conectando con el backend para consultar observaciones SPHEREx en IRSA…"
-  );
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [rawObservations, setRawObservations] = useState<Observacion[]>([]);
   const [dataSource, setDataSource] = useState<"irsa" | "fallback">("irsa");
 
@@ -214,11 +374,10 @@ export default function WiseViewExplorer() {
     "canvas"
   );
   const [showPanStarrs, setShowPanStarrs] = useState(false);
-  const [view360, setView360] = useState(false);
   const [collectionFilter, setCollectionFilter] = useState("Todas");
   const [bandFilter, setBandFilter] = useState("Todas");
   const [colormap, setColormap] = useState<ColormapMode>("wiseview-inverted");
-  const [fovArcsec, setFovArcsec] = useState(60);
+  const [fovArcsec, setFovArcsec] = useState(DEFAULT_FOV_ARCSEC);
   const [stretchGain, setStretchGain] = useState(1.2);
   const [showCrosshair, setShowCrosshair] = useState(true);
   const [showGrid, setShowGrid] = useState(false);
@@ -229,6 +388,8 @@ export default function WiseViewExplorer() {
   const [copiedShareUrl, setCopiedShareUrl] = useState(false);
   const [customSelectedSource, setCustomSelectedSource] =
     useState<SelectedSkySource | null>(null);
+  const [solvedSkyImage, setSolvedSkyImage] =
+    useState<SolvedSkyImageState | null>(null);
 
   // Video / Blink playback controls
   const [isPlaying, setIsPlaying] = useState(true);
@@ -237,9 +398,6 @@ export default function WiseViewExplorer() {
   const [currentFrameIndex, setCurrentFrameIndex] = useState(0);
   const pingPongDirRef = useRef<1 | -1>(1);
   const preloaderWorkerRef = useRef<Worker | null>(null);
-
-  const liveParsedRa = useMemo(() => parseRightAscension(raInput), [raInput]);
-  const liveParsedDec = useMemo(() => parseDeclination(decInput), [decInput]);
 
   // Distinct collections & spectral bands available in current results
   const availableCollections = useMemo(() => {
@@ -252,27 +410,6 @@ export default function WiseViewExplorer() {
       rawObservations.map((o) => o.banda_espectral).filter(Boolean)
     );
     return ["Todas", ...Array.from(set)];
-  }, [rawObservations]);
-
-  const detectorCounts = useMemo(() => {
-    const counts: Record<string, number> = {
-      D1: 0,
-      D2: 0,
-      D3: 0,
-      D4: 0,
-      D5: 0,
-      D6: 0,
-    };
-    for (const obs of rawObservations) {
-      const m =
-        obs.banda_espectral.match(/D([1-6])/i) ||
-        obs.identificador.match(/_([1-6])(?:D|$)/i);
-      if (m) {
-        const key = `D${m[1]}`;
-        counts[key] = (counts[key] || 0) + 1;
-      }
-    }
-    return counts;
   }, [rawObservations]);
 
   const filteredObservations = useMemo(() => {
@@ -295,15 +432,25 @@ export default function WiseViewExplorer() {
   const safeFrameIndex =
     frames.length === 0 ? 0 : Math.min(currentFrameIndex, frames.length - 1);
 
-  // Sincronizar paleta del visor con el cambio de tema claro/oscuro
+  // Sincronizar paleta del visor con el cambio de tema claro/oscuro (incluyendo el tema inicial al montar)
   useEffect(() => {
-    function handleThemeEvent(e: Event) {
-      const custom = e as CustomEvent<"light" | "dark">;
-      if (custom.detail === "dark") {
+    const syncFromTheme = (theme: string | null) => {
+      if (theme === "dark") {
         setColormap("grayscale");
-      } else if (custom.detail === "light") {
+      } else if (theme === "light") {
         setColormap("wiseview-inverted");
       }
+    };
+    const initialTheme =
+      document.documentElement.getAttribute("data-theme") ??
+      (document.documentElement.classList.contains("dark") ? "dark" : null);
+    if (initialTheme) {
+      queueMicrotask(() => syncFromTheme(initialTheme));
+    }
+
+    function handleThemeEvent(e: Event) {
+      const custom = e as CustomEvent<"light" | "dark">;
+      syncFromTheme(custom.detail);
     }
     window.addEventListener("spherex-theme-change", handleThemeEvent);
     return () => {
@@ -382,55 +529,25 @@ export default function WiseViewExplorer() {
       setCurrentFrameIndex(0);
       setIsPlaying(true);
       pingPongDirRef.current = 1;
-      setStatusMessage(
-        `Consultando productos SPHEREx en IRSA para RA ${raDeg.toFixed(
-          4
-        )}°, Dec ${decDeg.toFixed(4)}°…`
-      );
+      setFetchError(null);
 
       try {
-        const params = new URLSearchParams({
-          ascension_recta: raDeg.toFixed(6),
-          declinacion: decDeg.toFixed(6),
-          radio: String(radiusArcsec),
-        });
-        const response = await fetch(`/api/v1/observaciones?${params.toString()}`);
-
-        if (!response.ok) {
-          let errDetail = `HTTP ${response.status}`;
-          try {
-            const errJson = await response.json();
-            if (errJson?.detail) errDetail = String(errJson.detail);
-          } catch {
-            // ignorar si no es JSON
-          }
-          throw new Error(errDetail);
-        }
-
-        const payload: ObservacionesResponse = await response.json();
+        const payload = await fetchRegionObservationsData(
+          raDeg,
+          decDeg,
+          radiusArcsec
+        );
         const obsList = Array.isArray(payload.observaciones)
           ? payload.observaciones
           : [];
         setRawObservations(obsList);
         setDataSource("irsa");
-        if (obsList.length > 0) {
-          setStatusMessage(
-            `${payload.total ?? obsList.length} observaciones reales cargadas desde el backend para ${formatRAHMS(
-              raDeg
-            )}, ${formatDecDMS(decDeg)}.`
-          );
-        } else {
-          setStatusMessage(
-            `El backend devolvió 0 observaciones en IRSA para ${formatRAHMS(
-              raDeg
-            )}, ${formatDecDMS(decDeg)}.`
-          );
-        }
+        setFetchError(null);
       } catch (err) {
         setRawObservations([]);
-        setStatusMessage(
+        setFetchError(
           err instanceof Error
-            ? `Error al consultar el backend: ${err.message}`
+            ? err.message
             : "Error al consultar el backend de observaciones."
         );
       } finally {
@@ -446,14 +563,14 @@ export default function WiseViewExplorer() {
 
     if (typeof Worker !== "undefined") {
       try {
-        const worker = new Worker("/spherex-preloader.worker.js");
+        const worker = new Worker(withBasePath("/spherex-preloader.worker.js"));
         preloaderWorkerRef.current = worker;
         worker.postMessage({
           urls: [
-            "/aladin.js",
-            "/processed/2025W41_2B_0509_2_D1_aladin_fast.fits",
-            "/processed/2025W41_2B_0509_2_D1_preview.png",
-            "/processed/2025W41_2B_0509_2_D1_wavelength.png",
+            withBasePath("/aladin.js"),
+            withBasePath("/processed/2025W41_2B_0509_2_D1_aladin_fast.fits"),
+            withBasePath("/processed/2025W41_2B_0509_2_D1_preview.png"),
+            withBasePath("/processed/2025W41_2B_0509_2_D1_wavelength.png"),
           ],
         });
         return () => {
@@ -504,9 +621,9 @@ export default function WiseViewExplorer() {
             view.fov <= 2.5
               ? Math.round(view.fov * 3600)
               : Math.round(view.fov);
-          const clamped = Math.max(15, Math.min(240, arcsec));
+          const clamped = clampFovArcsec(arcsec);
           setFovArcsec(clamped);
-          startRadius = Math.max(15, Math.min(360, arcsec));
+          startRadius = Math.max(15, Math.min(3600, arcsec));
         }
 
         if (
@@ -567,6 +684,13 @@ export default function WiseViewExplorer() {
     window.setTimeout(() => setCopiedShareUrl(false), 2200);
   }
 
+  function clearSolvedSkyImage() {
+    if (solvedSkyImage?.previewUrl) {
+      URL.revokeObjectURL(solvedSkyImage.previewUrl);
+    }
+    setSolvedSkyImage(null);
+  }
+
   function handleSearchSubmit(e: FormEvent) {
     e.preventDefault();
     const raDeg = parseRightAscension(raInput);
@@ -590,20 +714,44 @@ export default function WiseViewExplorer() {
       return;
     }
 
+    clearSolvedSkyImage();
     fetchRegionObservations(raDeg, decDeg, radius, null);
   }
 
   function handleSelectPreset(target: ChallengeTarget) {
+    clearSolvedSkyImage();
     setRaInput(target.raInput);
     setDecInput(target.decInput);
     setCustomSelectedSource(null);
     setIsPlaying(true);
-    setFovArcsec(target.category === "binary-brown-dwarf" ? 80 : 90);
+    setFovArcsec(DEFAULT_FOV_ARCSEC);
     fetchRegionObservations(
       target.raDeg,
       target.decDeg,
       Number.parseFloat(radiusInput) || 60,
       target
+    );
+  }
+
+  function handleResolvedSkyImage(solved: SolvedSkyImageState) {
+    if (
+      solvedSkyImage?.previewUrl &&
+      solvedSkyImage.previewUrl !== solved.previewUrl
+    ) {
+      URL.revokeObjectURL(solvedSkyImage.previewUrl);
+    }
+    setSolvedSkyImage(solved);
+    setRaInput(formatRAHMS(solved.result.ra_deg));
+    setDecInput(formatDecDMS(solved.result.dec_deg));
+    setRadiusInput(String(solved.result.radio_sugerido_arcsec));
+    setCustomSelectedSource(null);
+    setIsPlaying(true);
+    setFovArcsec(clampFovArcsec(solved.result.fov_arcsec));
+    fetchRegionObservations(
+      solved.result.ra_deg,
+      solved.result.dec_deg,
+      solved.result.radio_sugerido_arcsec,
+      null
     );
   }
 
@@ -622,9 +770,6 @@ export default function WiseViewExplorer() {
   }
 
   const currentFrame = frames[safeFrameIndex];
-  const inspectedObservacion =
-    (isPlaying ? frames[0]?.observacion : currentFrame?.observacion) ??
-    currentFrame?.observacion;
   const midYears =
     frames.length > 0
       ? frames[Math.floor((frames.length - 1) / 2)].yearsFromRef
@@ -662,6 +807,46 @@ export default function WiseViewExplorer() {
     currentOffset.dDecArcsec,
   ]);
 
+  const chatbotContext: ChatVisorContext = useMemo(
+    () => ({
+      audienceMode,
+      activeTarget,
+      activeRaDeg,
+      activeDecDeg,
+      fovArcsec,
+      viewerMode,
+      stackByDetector,
+      showHistoricalCatalogOverlay,
+      showGrid,
+      colormap,
+      bandFilter,
+      framesCount: frames.length,
+      selectedSource: effectiveSelectedSource,
+      lastSolvedImage: solvedSkyImage
+        ? {
+            fileName: solvedSkyImage.fileName,
+            result: solvedSkyImage.result,
+          }
+        : null,
+    }),
+    [
+      audienceMode,
+      activeTarget,
+      activeRaDeg,
+      activeDecDeg,
+      fovArcsec,
+      viewerMode,
+      stackByDetector,
+      showHistoricalCatalogOverlay,
+      showGrid,
+      colormap,
+      bandFilter,
+      frames.length,
+      effectiveSelectedSource,
+      solvedSkyImage,
+    ]
+  );
+
   return (
     <div className="min-h-screen bg-background text-foreground">
       {/* Top Bar */}
@@ -691,7 +876,7 @@ export default function WiseViewExplorer() {
                 }`}
               >
                 <Sparkles className="h-3.5 w-3.5" />
-                <span>Paseo Estelar (Para todos)</span>
+                <span>Paseo Estelar</span>
               </button>
               <button
                 type="button"
@@ -703,7 +888,7 @@ export default function WiseViewExplorer() {
                 }`}
               >
                 <FlaskConical className="h-3.5 w-3.5" />
-                <span>Modo Investigador (NASA)</span>
+                <span>Modo Investigador</span>
               </button>
             </div>
           </div>
@@ -713,41 +898,19 @@ export default function WiseViewExplorer() {
               type="button"
               onClick={handleShareDiscoveryUrl}
               className="inline-flex h-8 items-center justify-center gap-1.5 rounded-full border border-black/[.08] px-3 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
-              title="Copiar URL con ?ra=...&dec=...&fov=... para compartir este rincón del cielo"
+              title="Copiar enlace de esta región"
             >
               {copiedShareUrl ? (
                 <>
                   <Check className="h-3.5 w-3.5 text-emerald-500" />
-                  <span>¡Enlace copiado!</span>
+                  <span>Copiado</span>
                 </>
               ) : (
                 <>
                   <Share2 className="h-3.5 w-3.5" />
-                  <span>
-                    {audienceMode === "public"
-                      ? "Compartir esta estrella"
-                      : "Compartir enlace (?ra=&dec=&fov=)"}
-                  </span>
+                  <span>Compartir</span>
                 </>
               )}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setView360((prev) => !prev);
-                setViewerMode("canvas");
-              }}
-              className={`inline-flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors ${
-                view360
-                  ? "bg-foreground text-background shadow-sm"
-                  : "border border-black/[.08] hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
-              }`}
-              title="Alternar Mapa del cielo 360° interactivo (React Three Fiber)"
-            >
-              <Globe className="h-3.5 w-3.5" />
-              <span>
-                {view360 ? "Vista 360° activa" : "Mapa del cielo 360°"}
-              </span>
             </button>
             {audienceMode === "researcher" && (
               <Link
@@ -802,32 +965,40 @@ export default function WiseViewExplorer() {
               : "h-[calc(100vh-53px)] overflow-hidden"
           }`}
         >
-          {frames.length > 0 && currentFrame && (
-            <div className={showPanStarrs ? "h-[58vh] w-full" : "h-full w-full"}>
-              <SkyVideoCanvas
-                key={`public-${activeRaDeg.toFixed(6)}:${activeDecDeg.toFixed(6)}`}
-                centerRaDeg={activeRaDeg}
-                centerDecDeg={activeDecDeg}
-                frames={frames}
-                currentFrameIndex={safeFrameIndex}
-                referenceFrameIndex={0}
-                activeTarget={activeTarget}
-                fovArcsec={fovArcsec}
-                stretchGain={stretchGain}
-                colormap={colormap}
-                playbackMode={playbackMode}
-                showCrosshair={showCrosshair}
-                showGrid={showGrid}
-                showTargetOverlay={showTargetOverlay}
-                showHistoricalCatalogOverlay={showHistoricalCatalogOverlay}
-                stackByDetector={stackByDetector}
-                selectedSource={effectiveSelectedSource}
-                onSelectSkySource={(src) => setCustomSelectedSource(src)}
-                onZoomChange={setFovArcsec}
-                fullViewport
-                view360={view360}
-              />
+          {loading && frames.length === 0 ? (
+            <div className="flex h-full min-h-[360px] items-center justify-center">
+              <div className="rounded-full border border-black/[.08] bg-background/90 px-4 py-2 text-xs text-foreground/75 shadow-sm backdrop-blur-md dark:border-white/[.145]">
+                Cargando observaciones del cielo…
+              </div>
             </div>
+          ) : (
+            frames.length > 0 &&
+            currentFrame && (
+              <div className={showPanStarrs ? "h-[58vh] w-full" : "h-full w-full"}>
+                <SkyVideoCanvas
+                  key={`public-${activeRaDeg.toFixed(6)}:${activeDecDeg.toFixed(6)}`}
+                  centerRaDeg={activeRaDeg}
+                  centerDecDeg={activeDecDeg}
+                  frames={frames}
+                  currentFrameIndex={safeFrameIndex}
+                  referenceFrameIndex={0}
+                  activeTarget={activeTarget}
+                  fovArcsec={fovArcsec}
+                  stretchGain={stretchGain}
+                  colormap={colormap}
+                  playbackMode={playbackMode}
+                  showCrosshair={showCrosshair}
+                  showGrid={showGrid}
+                  showTargetOverlay={showTargetOverlay}
+                  showHistoricalCatalogOverlay={showHistoricalCatalogOverlay}
+                  stackByDetector={stackByDetector}
+                  selectedSource={effectiveSelectedSource}
+                  onSelectSkySource={(src) => setCustomSelectedSource(src)}
+                  onZoomChange={setFovArcsec}
+                  fullViewport
+                />
+              </div>
+            )
           )}
 
           {showPanStarrs && (
@@ -875,38 +1046,11 @@ export default function WiseViewExplorer() {
                 panelClassName="left-1/2 -translate-x-1/2 w-72 sm:w-80"
               >
                 <div className="space-y-3.5">
-                  <div>
-                    <div className="flex items-center justify-between text-xs">
-                      <label
-                        htmlFor="public-zoom-slider"
-                        className="font-medium"
-                      >
-                        Zoom · Campo de visión (FOV)
-                      </label>
-                      <span className="font-mono text-foreground/70">
-                        {(240 / fovArcsec).toFixed(1)}× ({fovArcsec}&quot;)
-                      </span>
-                    </div>
-                    <div className="mt-1.5 flex items-center gap-2">
-                      <ZoomOut className="h-3.5 w-3.5 shrink-0 text-foreground/60" />
-                      <input
-                        id="public-zoom-slider"
-                        type="range"
-                        min={15}
-                        max={240}
-                        step={5}
-                        value={255 - fovArcsec}
-                        onChange={(e) => {
-                          const inverted = Number.parseInt(e.target.value, 10);
-                          setFovArcsec(
-                            Math.max(15, Math.min(240, 255 - inverted))
-                          );
-                        }}
-                        className="w-full cursor-pointer accent-foreground"
-                      />
-                      <ZoomIn className="h-3.5 w-3.5 shrink-0 text-foreground/60" />
-                    </div>
-                  </div>
+                  <ZoomSliderField
+                    inputId="public-zoom-slider"
+                    fovArcsec={fovArcsec}
+                    onChange={setFovArcsec}
+                  />
 
                   <div>
                     <div className="flex items-center justify-between text-xs">
@@ -914,7 +1058,7 @@ export default function WiseViewExplorer() {
                         htmlFor="public-stretch-range"
                         className="font-medium"
                       >
-                        Contraste (asinh)
+                        Contraste
                       </label>
                       <span className="font-mono text-foreground/70">
                         {stretchGain.toFixed(1)}×
@@ -937,17 +1081,13 @@ export default function WiseViewExplorer() {
                   <button
                     type="button"
                     onClick={() => {
-                      setFovArcsec(
-                        activeTarget?.category === "binary-brown-dwarf"
-                          ? 80
-                          : 90
-                      );
+                      setFovArcsec(DEFAULT_FOV_ARCSEC);
                       setStretchGain(1.2);
                     }}
                     className="inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-full border border-black/[.08] px-4 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
-                    <span>Restablecer zoom y contraste</span>
+                    <span>Restablecer</span>
                   </button>
                 </div>
               </CustomSelect>
@@ -967,7 +1107,7 @@ export default function WiseViewExplorer() {
                       htmlFor="public-collection-select"
                       className="mb-1 block text-xs font-medium text-foreground/80"
                     >
-                      Colección SPHEREx
+                      Colección
                     </label>
                     <CustomSelect
                       id="public-collection-select"
@@ -988,7 +1128,7 @@ export default function WiseViewExplorer() {
                       htmlFor="public-band-select"
                       className="mb-1 block text-xs font-medium text-foreground/80"
                     >
-                      Banda espectral
+                      Banda
                     </label>
                     <CustomSelect
                       id="public-band-select"
@@ -1009,7 +1149,7 @@ export default function WiseViewExplorer() {
                       htmlFor="public-colormap-select"
                       className="mb-1 block text-xs font-medium text-foreground/80"
                     >
-                      Paleta de color
+                      Paleta
                     </label>
                     <CustomSelect
                       id="public-colormap-select"
@@ -1017,58 +1157,32 @@ export default function WiseViewExplorer() {
                       options={[
                         {
                           value: "wiseview-inverted",
-                          label: "Invertido (Alto contraste)",
+                          label: "Invertido",
                         },
-                        { value: "grayscale", label: "Escala de grises" },
-                        { value: "infrared", label: "Infrarrojo térmico" },
+                        { value: "grayscale", label: "Grises" },
+                        { value: "infrared", label: "Infrarrojo" },
                       ]}
                       onChange={(val) => setColormap(val as ColormapMode)}
                     />
                   </div>
 
-                  <div className="space-y-2 border-t border-black/[.08] pt-2.5 text-xs dark:border-white/[.145]">
-                    <label className="flex cursor-pointer items-center gap-2">
-                      <input
-                        type="checkbox"
-                        checked={showCrosshair}
-                        onChange={(e) => setShowCrosshair(e.target.checked)}
-                      />
-                      <span>Retícula central</span>
-                    </label>
-                    <label className="flex cursor-pointer items-center gap-2">
-                      <input
-                        type="checkbox"
-                        checked={showGrid}
-                        onChange={(e) => setShowGrid(e.target.checked)}
-                      />
-                      <span>Rejilla WCS (RA / Dec)</span>
-                    </label>
-                    <label className="flex cursor-pointer items-center gap-2">
-                      <input
-                        type="checkbox"
-                        checked={showTargetOverlay}
-                        onChange={(e) => setShowTargetOverlay(e.target.checked)}
-                      />
-                      <span>Resaltar trayectoria / variabilidad</span>
-                    </label>
-                    <label className="flex cursor-pointer items-center gap-2">
-                      <input
-                        type="checkbox"
-                        checked={showHistoricalCatalogOverlay}
-                        onChange={(e) =>
-                          setShowHistoricalCatalogOverlay(e.target.checked)
-                        }
-                      />
-                      <span>Comparar con AllWISE (2010) y Gaia DR3</span>
-                    </label>
-                    <label className="flex cursor-pointer items-center gap-2">
-                      <input
-                        type="checkbox"
-                        checked={stackByDetector}
-                        onChange={(e) => setStackByDetector(e.target.checked)}
-                      />
-                      <span>Apilar por detector (Coadd D1–D6)</span>
-                    </label>
+                  <div className="space-y-1.5 border-t border-black/[.08] pt-2.5 text-xs dark:border-white/[.145]">
+                    <FilterToggleList
+                      showCrosshair={showCrosshair}
+                      onToggleCrosshair={setShowCrosshair}
+                      showGrid={showGrid}
+                      onToggleGrid={setShowGrid}
+                      showTargetOverlay={showTargetOverlay}
+                      onToggleTargetOverlay={setShowTargetOverlay}
+                      showHistoricalCatalogOverlay={
+                        showHistoricalCatalogOverlay
+                      }
+                      onToggleHistoricalCatalogOverlay={
+                        setShowHistoricalCatalogOverlay
+                      }
+                      stackByDetector={stackByDetector}
+                      onToggleStackByDetector={setStackByDetector}
+                    />
                   </div>
                 </div>
               </CustomSelect>
@@ -1077,7 +1191,7 @@ export default function WiseViewExplorer() {
               <CustomSelect
                 id="public-detectors-select"
                 value={bandFilter}
-                title="Detectores (D1–D6) y nitidez"
+                title="Detectores (D1–D6)"
                 icon={<Waves className="h-4 w-4" />}
                 iconOnly
                 dropUp
@@ -1094,21 +1208,19 @@ export default function WiseViewExplorer() {
                   >
                     <Layers className="h-3.5 w-3.5" />
                     <span>
-                      {stackByDetector
-                        ? "Nitidez mejorada activa"
-                        : "Mejorar nitidez (Apilar)"}
+                      {stackByDetector ? "Apilado activo" : "Apilar exposiciones"}
                     </span>
                   </button>
                 }
                 options={[
                   {
                     value: "Todas",
-                    label: "6 Detectores (102 bandas)",
+                    label: "Todos (D1–D6)",
                   },
                   ...SPHEREX_DETECTORS.map((det) => ({
                     value: det.name,
-                    label: `${det.code} (${det.minUm}–${det.maxUm} µm)`,
-                    badge: `${detectorCounts[det.code] || 1} exp`,
+                    label: det.code,
+                    badge: `${det.minUm}–${det.maxUm} µm`,
                     colorDot: det.color,
                   })),
                 ]}
@@ -1170,225 +1282,40 @@ export default function WiseViewExplorer() {
               </div>
             </div>
           </div>
-
-          {/* FAB (Floating Action Button) de Coordenadas del cielo heredado de CustomSelect */}
-          <div className="pointer-events-auto absolute bottom-5 right-5 z-20">
-            <CustomSelect
-              id="public-coordinates-fab"
-              title="Coordenadas del cielo"
-              icon={<Compass className="h-5 w-5" />}
-              iconOnly
-              triggerClassName="h-12 w-12 shadow-xl border-black/[.14] bg-background/95 backdrop-blur-md dark:border-white/[.22]"
-              dropUp
-              panelClassName="right-0 w-80"
-            >
-              <div>
-                <div className="flex items-center gap-2">
-                  <Compass className="h-4 w-4 text-foreground/80" />
-                  <h2 className="text-sm font-semibold">
-                    Coordenadas del cielo
-                  </h2>
-                </div>
-                <p className="mt-1 text-xs text-foreground/60">
-                  Introduce RA y Dec en grados decimales o formato HMS/DMS.
-                </p>
-
-                <form onSubmit={handleSearchSubmit} className="mt-3 space-y-3">
-                  <div>
-                    <label
-                      htmlFor="public-ra-input"
-                      className="block text-xs font-medium text-foreground/80"
-                    >
-                      Ascensión recta (RA)
-                    </label>
-                    <input
-                      id="public-ra-input"
-                      type="text"
-                      value={raInput}
-                      onChange={(e) => setRaInput(e.target.value)}
-                      placeholder="08h55m10.831s o 133.7951"
-                      className="mt-1 h-10 w-full rounded-full border border-black/[.08] bg-background px-4 font-mono text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.145]"
-                    />
-                    {liveParsedRa !== null && (
-                      <p className="mt-1 pl-3 font-mono text-[11px] text-foreground/60">
-                        = {liveParsedRa.toFixed(6)}° ({formatRAHMS(liveParsedRa)}
-                        )
-                      </p>
-                    )}
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="public-dec-input"
-                      className="block text-xs font-medium text-foreground/80"
-                    >
-                      Declinación (Dec)
-                    </label>
-                    <input
-                      id="public-dec-input"
-                      type="text"
-                      value={decInput}
-                      onChange={(e) => setDecInput(e.target.value)}
-                      placeholder="-7d14m42.53s o -7.2451"
-                      className="mt-1 h-10 w-full rounded-full border border-black/[.08] bg-background px-4 font-mono text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.145]"
-                    />
-                    {liveParsedDec !== null && (
-                      <p className="mt-1 pl-3 font-mono text-[11px] text-foreground/60">
-                        = {liveParsedDec.toFixed(6)}° (
-                        {formatDecDMS(liveParsedDec)})
-                      </p>
-                    )}
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="public-radius-input"
-                      className="block text-xs font-medium text-foreground/80"
-                    >
-                      Radio de consulta (arcsec)
-                    </label>
-                    <input
-                      id="public-radius-input"
-                      type="number"
-                      min={1}
-                      max={3600}
-                      step={1}
-                      value={radiusInput}
-                      onChange={(e) => setRadiusInput(e.target.value)}
-                      className="mt-1 h-10 w-full rounded-full border border-black/[.08] bg-background px-4 font-mono text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.145]"
-                    />
-                  </div>
-
-                  {inputError && (
-                    <p className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
-                      {inputError}
-                    </p>
-                  )}
-
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-full bg-foreground px-4 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
-                  >
-                    <Search className="h-4 w-4" />
-                    <span>
-                      {loading
-                        ? "Consultando SPHEREx…"
-                        : "Cargar observaciones"}
-                    </span>
-                  </button>
-                </form>
-              </div>
-            </CustomSelect>
-          </div>
         </div>
       ) : (
-        /* Main Workspace (Modo Investigador NASA intacto) */
+        /* Main Workspace (Modo Investigador) */
         <div className="mx-auto grid max-w-7xl grid-cols-1 gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[340px_minmax(0,1fr)]">
           {/* Left Control Panel */}
           <aside className="space-y-6">
-            {/* Coordinate Search Form */}
+            {/* Image-first Sky Search + Collapsible Manual Coordinates */}
             <section className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
-              <div className="flex items-center gap-2">
-                <Compass className="h-4 w-4 text-foreground/80" />
-                <h2 className="text-sm font-semibold">Coordenadas del cielo</h2>
-              </div>
-              <p className="mt-1 text-xs text-foreground/60">
-                Introduce RA y Dec en grados decimales o formato HMS/DMS.
-              </p>
-
-              <form onSubmit={handleSearchSubmit} className="mt-4 space-y-3">
-              <div>
-                <label
-                  htmlFor="ra-input"
-                  className="block text-xs font-medium text-foreground/80"
-                >
-                  Ascensión recta (RA)
-                </label>
-                <input
-                  id="ra-input"
-                  type="text"
-                  value={raInput}
-                  onChange={(e) => setRaInput(e.target.value)}
-                  placeholder="08h55m10.831s o 133.7951"
-                  className="mt-1 h-10 w-full rounded-full border border-black/[.08] bg-background px-4 font-mono text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.145]"
-                />
-                {liveParsedRa !== null && (
-                  <p className="mt-1 pl-3 font-mono text-[11px] text-foreground/60">
-                    = {liveParsedRa.toFixed(6)}° ({formatRAHMS(liveParsedRa)})
-                  </p>
-                )}
+              <div className="mb-3 flex items-center gap-2">
+                <ImagePlus className="h-4 w-4 text-foreground/80" />
+                <h2 className="text-sm font-semibold">Imagen del cielo</h2>
               </div>
 
-              <div>
-                <label
-                  htmlFor="dec-input"
-                  className="block text-xs font-medium text-foreground/80"
-                >
-                  Declinación (Dec)
-                </label>
-                <input
-                  id="dec-input"
-                  type="text"
-                  value={decInput}
-                  onChange={(e) => setDecInput(e.target.value)}
-                  placeholder="-7d14m42.53s o -7.2451"
-                  className="mt-1 h-10 w-full rounded-full border border-black/[.08] bg-background px-4 font-mono text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.145]"
-                />
-                {liveParsedDec !== null && (
-                  <p className="mt-1 pl-3 font-mono text-[11px] text-foreground/60">
-                    = {liveParsedDec.toFixed(6)}° ({formatDecDMS(liveParsedDec)})
-                  </p>
-                )}
-              </div>
-
-              <div>
-                <label
-                  htmlFor="radius-input"
-                  className="block text-xs font-medium text-foreground/80"
-                >
-                  Radio de consulta (arcsec)
-                </label>
-                <input
-                  id="radius-input"
-                  type="number"
-                  min={1}
-                  max={3600}
-                  step={1}
-                  value={radiusInput}
-                  onChange={(e) => setRadiusInput(e.target.value)}
-                  className="mt-1 h-10 w-full rounded-full border border-black/[.08] bg-background px-4 font-mono text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-foreground/20 dark:border-white/[.145]"
-                />
-              </div>
-
-              {inputError && (
-                <p className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
-                  {inputError}
-                </p>
-              )}
-
-              <button
-                type="submit"
-                disabled={loading}
-                className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-full bg-foreground px-4 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
-              >
-                <Search className="h-4 w-4" />
-                <span>
-                  {loading ? "Consultando SPHEREx…" : "Cargar observaciones"}
-                </span>
-              </button>
-            </form>
-          </section>
+              <SkyCoordinateSearch
+                raInput={raInput}
+                decInput={decInput}
+                radiusInput={radiusInput}
+                inputError={inputError}
+                loadingObservations={loading}
+                solvedImage={solvedSkyImage}
+                onChangeRa={setRaInput}
+                onChangeDec={setDecInput}
+                onChangeRadius={setRadiusInput}
+                onSubmitManual={handleSearchSubmit}
+                onSolvedImage={handleResolvedSkyImage}
+              />
+            </section>
 
           {/* Mandatory Challenge Targets as Select + Custom Zoom Sliders */}
           <section className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
             <div className="flex items-center gap-2">
               <Sparkles className="h-4 w-4 text-foreground/80" />
-              <h2 className="text-sm font-semibold">Objetos de prueba</h2>
+              <h2 className="text-sm font-semibold">Objetos</h2>
             </div>
-            <p className="mt-1 text-xs text-foreground/60">
-              Casos de movimiento rápido, binarias y estrellas variables.
-            </p>
 
             <div className="mt-3">
               <label htmlFor="target-preset-select" className="sr-only">
@@ -1409,51 +1336,20 @@ export default function WiseViewExplorer() {
                   }
                 }}
               />
-
-              {activeTarget && (
-                <div className="mt-2 flex items-center justify-between gap-2 px-2 text-[11px] text-foreground/70">
-                  <span>{activeTarget.categoryLabel}</span>
-                  <span className="font-mono">
-                    {activeTarget.raInput} · {activeTarget.decInput}
-                  </span>
-                </div>
-              )}
             </div>
 
             {/* Custom Zoom & Contrast Sliders below the Objects Select */}
             <div className="mt-4 space-y-3 border-t border-black/[.08] pt-4 dark:border-white/[.145]">
-              <div>
-                <div className="flex items-center justify-between text-xs">
-                  <label htmlFor="zoom-slider" className="font-medium">
-                    Zoom · Campo de visión (FOV)
-                  </label>
-                  <span className="font-mono text-foreground/70">
-                    {(240 / fovArcsec).toFixed(1)}× ({fovArcsec}&quot;)
-                  </span>
-                </div>
-                <div className="mt-1.5 flex items-center gap-2">
-                  <ZoomOut className="h-3.5 w-3.5 shrink-0 text-foreground/60" />
-                  <input
-                    id="zoom-slider"
-                    type="range"
-                    min={15}
-                    max={240}
-                    step={5}
-                    value={255 - fovArcsec}
-                    onChange={(e) => {
-                      const inverted = Number.parseInt(e.target.value, 10);
-                      setFovArcsec(Math.max(15, Math.min(240, 255 - inverted)));
-                    }}
-                    className="w-full cursor-pointer accent-foreground"
-                  />
-                  <ZoomIn className="h-3.5 w-3.5 shrink-0 text-foreground/60" />
-                </div>
-              </div>
+              <ZoomSliderField
+                inputId="zoom-slider"
+                fovArcsec={fovArcsec}
+                onChange={setFovArcsec}
+              />
 
               <div>
                 <div className="flex items-center justify-between text-xs">
                   <label htmlFor="stretch-range" className="font-medium">
-                    Contraste (asinh)
+                    Contraste
                   </label>
                   <span className="font-mono text-foreground/70">
                     {stretchGain.toFixed(1)}×
@@ -1476,15 +1372,13 @@ export default function WiseViewExplorer() {
               <button
                 type="button"
                 onClick={() => {
-                  setFovArcsec(
-                    activeTarget?.category === "binary-brown-dwarf" ? 45 : 60
-                  );
+                  setFovArcsec(DEFAULT_FOV_ARCSEC);
                   setStretchGain(1.2);
                 }}
                 className="inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-full border border-black/[.08] px-4 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
-                <span>Restablecer zoom y contraste</span>
+                <span>Restablecer</span>
               </button>
             </div>
           </section>
@@ -1493,7 +1387,7 @@ export default function WiseViewExplorer() {
           <section className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
             <div className="flex items-center gap-2">
               <Film className="h-4 w-4 text-foreground/80" />
-              <h2 className="text-sm font-semibold">Reproducción temporal</h2>
+              <h2 className="text-sm font-semibold">Reproducción</h2>
             </div>
 
             <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -1506,7 +1400,7 @@ export default function WiseViewExplorer() {
                 {isPlaying ? (
                   <>
                     <Pause className="h-3.5 w-3.5" />
-                    <span>Pausar vídeo</span>
+                    <span>Pausar</span>
                   </>
                 ) : (
                   <>
@@ -1547,7 +1441,7 @@ export default function WiseViewExplorer() {
               <div>
                 <div className="flex justify-between text-xs">
                   <label htmlFor="epoch-scrubber" className="font-medium">
-                    Época actual
+                    Época
                   </label>
                   <span className="font-mono text-foreground/70">
                     {frames.length > 0
@@ -1572,7 +1466,7 @@ export default function WiseViewExplorer() {
               <div>
                 <div className="flex justify-between text-xs">
                   <label htmlFor="fps-range" className="font-medium">
-                    Velocidad (FPS)
+                    Velocidad
                   </label>
                   <span className="font-mono text-foreground/70">{fps} fps</span>
                 </div>
@@ -1592,28 +1486,19 @@ export default function WiseViewExplorer() {
                   htmlFor="playback-mode"
                   className="mb-1 block text-xs font-medium text-foreground/80"
                 >
-                  Modo de visualización
+                  Modo
                 </label>
                 <CustomSelect
                   id="playback-mode"
                   value={playbackMode}
                   options={[
-                    { value: "ping-pong", label: "Ping-Pong (Blink)" },
-                    { value: "loop", label: "Ciclo continuo (Loop)" },
-                    {
-                      value: "difference",
-                      label: "Resta: Época N − Época 1 (Dipolo)",
-                    },
-                    {
-                      value: "sum",
-                      label: "Suma: Época N + Época 1 (Rastro)",
-                    },
+                    { value: "ping-pong", label: "Ping-Pong" },
+                    { value: "loop", label: "Loop" },
+                    { value: "difference", label: "Diferencia" },
+                    { value: "sum", label: "Suma" },
                   ]}
                   onChange={(val) => setPlaybackMode(val as PlaybackMode)}
                 />
-                <p className="mt-1.5 font-mono text-[11px] text-foreground/60">
-                  Teclado: ← / → cambiar época · Espacio Play/Pausa
-                </p>
               </div>
             </div>
           </section>
@@ -1622,7 +1507,7 @@ export default function WiseViewExplorer() {
           <section className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
             <div className="flex items-center gap-2">
               <SlidersHorizontal className="h-4 w-4 text-foreground/80" />
-              <h2 className="text-sm font-semibold">Filtros y ajustes de imagen</h2>
+              <h2 className="text-sm font-semibold">Filtros</h2>
             </div>
 
             <div className="mt-3 space-y-3">
@@ -1631,7 +1516,7 @@ export default function WiseViewExplorer() {
                   htmlFor="collection-select"
                   className="mb-1 block text-xs font-medium text-foreground/80"
                 >
-                  Colección SPHEREx
+                  Colección
                 </label>
                 <CustomSelect
                   id="collection-select"
@@ -1652,7 +1537,7 @@ export default function WiseViewExplorer() {
                   htmlFor="band-select"
                   className="mb-1 block text-xs font-medium text-foreground/80"
                 >
-                  Banda espectral
+                  Banda
                 </label>
                 <CustomSelect
                   id="band-select"
@@ -1673,7 +1558,7 @@ export default function WiseViewExplorer() {
                   htmlFor="colormap-select"
                   className="mb-1 block text-xs font-medium text-foreground/80"
                 >
-                  Paleta de color
+                  Paleta
                 </label>
                 <CustomSelect
                   id="colormap-select"
@@ -1681,58 +1566,30 @@ export default function WiseViewExplorer() {
                   options={[
                     {
                       value: "wiseview-inverted",
-                      label: "Invertido (Alto contraste)",
+                      label: "Invertido",
                     },
-                    { value: "grayscale", label: "Escala de grises" },
-                    { value: "infrared", label: "Infrarrojo térmico" },
+                    { value: "grayscale", label: "Grises" },
+                    { value: "infrared", label: "Infrarrojo" },
                   ]}
                   onChange={(val) => setColormap(val as ColormapMode)}
                 />
               </div>
 
-              <div className="space-y-2 pt-1 text-xs">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={showCrosshair}
-                    onChange={(e) => setShowCrosshair(e.target.checked)}
-                  />
-                  <span>Retícula central</span>
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={showGrid}
-                    onChange={(e) => setShowGrid(e.target.checked)}
-                  />
-                  <span>Rejilla WCS (RA / Dec)</span>
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={showTargetOverlay}
-                    onChange={(e) => setShowTargetOverlay(e.target.checked)}
-                  />
-                  <span>Resaltar trayectoria / variabilidad</span>
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={showHistoricalCatalogOverlay}
-                    onChange={(e) =>
-                      setShowHistoricalCatalogOverlay(e.target.checked)
-                    }
-                  />
-                  <span>Comparar con AllWISE (2010) y Gaia DR3</span>
-                </label>
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={stackByDetector}
-                    onChange={(e) => setStackByDetector(e.target.checked)}
-                  />
-                  <span>Apilar por detector (Coadd D1–D6)</span>
-                </label>
+              <div className="space-y-1.5 pt-1 text-xs">
+                <FilterToggleList
+                  showCrosshair={showCrosshair}
+                  onToggleCrosshair={setShowCrosshair}
+                  showGrid={showGrid}
+                  onToggleGrid={setShowGrid}
+                  showTargetOverlay={showTargetOverlay}
+                  onToggleTargetOverlay={setShowTargetOverlay}
+                  showHistoricalCatalogOverlay={showHistoricalCatalogOverlay}
+                  onToggleHistoricalCatalogOverlay={
+                    setShowHistoricalCatalogOverlay
+                  }
+                  stackByDetector={stackByDetector}
+                  onToggleStackByDetector={setStackByDetector}
+                />
               </div>
             </div>
           </section>
@@ -1753,10 +1610,14 @@ export default function WiseViewExplorer() {
                         )}`}
                   </h1>
                   <span className="rounded-full border border-black/[.08] bg-black/[.04] px-2.5 py-0.5 font-mono text-xs dark:border-white/[.145] dark:bg-white/[.06]">
-                    {frames.length} fotos SPHEREx
+                    {frames.length} obs
                   </span>
                 </div>
-                <p className="mt-1 text-xs text-foreground/70">{statusMessage}</p>
+                {fetchError && (
+                  <p className="mt-1 text-xs text-red-600 dark:text-red-400">
+                    {fetchError}
+                  </p>
+                )}
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
@@ -1770,7 +1631,7 @@ export default function WiseViewExplorer() {
                   }`}
                 >
                   <Film className="h-3.5 w-3.5" />
-                  <span>Secuencia temporal</span>
+                  <span>Secuencia</span>
                 </button>
                 <button
                   type="button"
@@ -1785,7 +1646,7 @@ export default function WiseViewExplorer() {
                   }`}
                 >
                   <ImageIcon className="h-3.5 w-3.5" />
-                  <span>FITS → PNG (Backend)</span>
+                  <span>FITS → PNG</span>
                 </button>
                 <button
                   type="button"
@@ -1800,7 +1661,7 @@ export default function WiseViewExplorer() {
                   }`}
                 >
                   <Globe className="h-3.5 w-3.5" />
-                  <span>Aladin Lite v3</span>
+                  <span>Aladin Lite</span>
                 </button>
                 <button
                   type="button"
@@ -1821,29 +1682,28 @@ export default function WiseViewExplorer() {
             {currentFrame ? (
               <div className="mt-3 grid grid-cols-2 gap-3 border-t border-black/[.08] pt-3 text-xs dark:border-white/[.145] sm:grid-cols-4">
                 <div>
-                  <span className="block text-foreground/60">Época activa</span>
+                  <span className="block text-foreground/60">Época</span>
                   <span className="font-mono font-medium">
                     {currentFrame.epochLabel}
                   </span>
                 </div>
                 <div>
-                  <span className="block text-foreground/60">ID observación</span>
+                  <span className="block text-foreground/60">ID</span>
                   <span className="font-mono font-medium">
                     {currentFrame.observacion.identificador}
                   </span>
                 </div>
                 <div>
-                  <span className="block text-foreground/60">Banda / Colección</span>
+                  <span className="block text-foreground/60">Banda</span>
                   <span className="font-mono font-medium">
-                    {currentFrame.observacion.banda_espectral} ·{" "}
-                    {currentFrame.observacion.coleccion}
+                    {currentFrame.observacion.banda_espectral}
                   </span>
                 </div>
                 <div>
                   <span className="block text-foreground/60">
                     {activeTarget?.category === "variable-star"
-                      ? "Flujo relativo"
-                      : "Desplazamiento época"}
+                      ? "Flujo"
+                      : "Desplazamiento"}
                   </span>
                   <span className="font-mono font-medium">
                     {activeTarget?.category === "variable-star"
@@ -1853,6 +1713,10 @@ export default function WiseViewExplorer() {
                         )}" · ΔDec ${currentOffset.dDecArcsec.toFixed(2)}"`}
                   </span>
                 </div>
+              </div>
+            ) : loading ? (
+              <div className="mt-3 border-t border-black/[.08] pt-3 text-xs text-foreground/70 dark:border-white/[.145]">
+                Cargando observaciones…
               </div>
             ) : (
               <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-black/[.08] pt-3 text-xs dark:border-white/[.145]">
@@ -1919,7 +1783,6 @@ export default function WiseViewExplorer() {
                 selectedSource={effectiveSelectedSource}
                 onSelectSkySource={(src) => setCustomSelectedSource(src)}
                 onZoomChange={setFovArcsec}
-                view360={view360}
               />
             )
           )}
@@ -1948,36 +1811,12 @@ export default function WiseViewExplorer() {
             onToggleStackByDetector={(next) => setStackByDetector(next)}
           />
 
-          {/* Target Scientific Note */}
-          {activeTarget && (
-            <section className="rounded-lg border border-black/[.08] p-4 text-xs dark:border-white/[.145]">
-              <p className="font-medium text-foreground">
-                {activeTarget.name} — {activeTarget.categoryLabel}
-              </p>
-              <p className="mt-1 text-foreground/70">
-                {activeTarget.description}
-              </p>
-              <p className="mt-2 font-mono text-[11px] text-foreground/60">
-                Movimiento propio: μ_RA = {activeTarget.pmRaMasYr} mas/año ·
-                μ_Dec = {activeTarget.pmDecMasYr} mas/año
-                {activeTarget.variabilityPeriodDays
-                  ? ` · Período variable ≈ ${activeTarget.variabilityPeriodDays} d (Δmag ≈ ${activeTarget.variabilityAmplitudeMag})`
-                  : ""}
-              </p>
-            </section>
-          )}
-
           {/* Epoch Filmstrip */}
           {frames.length > 0 && (
             <section className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
-              <div className="flex items-center justify-between gap-2">
-                <h2 className="text-sm font-semibold">
-                  Secuencia de fotogramas ({frames.length})
-                </h2>
-                <span className="font-mono text-xs text-foreground/60">
-                  Haz clic en cualquier época para inspeccionarla
-                </span>
-              </div>
+              <h2 className="text-sm font-semibold">
+                Fotogramas ({frames.length})
+              </h2>
 
               <div className="mt-3 flex gap-2.5 overflow-x-auto pb-1">
                 {frames.map((frame) => {
@@ -2023,22 +1862,11 @@ export default function WiseViewExplorer() {
             </section>
           )}
 
-          {/* Scientific FITS MEF Structure & Metadata Inspector */}
-          {inspectedObservacion && (
-            <FitsScientificInspector observacion={inspectedObservacion} />
-          )}
-
           {/* Observations Table */}
           <section className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="text-sm font-semibold">
-                Observaciones SPHEREx ({filteredObservations.length} de{" "}
-                {rawObservations.length})
-              </h2>
-              <span className="text-xs text-foreground/60">
-                Candidato visual ≠ descubrimiento confirmado
-              </span>
-            </div>
+            <h2 className="text-sm font-semibold">
+              Observaciones ({filteredObservations.length})
+            </h2>
 
             <div className="mt-3 overflow-x-auto">
               <table className="w-full border-collapse text-left text-xs">
@@ -2118,8 +1946,7 @@ export default function WiseViewExplorer() {
               </table>
               {frames.length > 40 && (
                 <p className="mt-2 text-xs text-foreground/60">
-                  Mostrando las primeras 40 observaciones de {frames.length}. Usa
-                  los filtros de colección o banda para acotar la lista.
+                  Mostrando 40 de {frames.length}.
                 </p>
               )}
             </div>
@@ -2127,6 +1954,44 @@ export default function WiseViewExplorer() {
         </main>
         </div>
       )}
+
+      {/* Botones flotantes inferiores derecha: subida de foto (Paseo) + Guía Astronómico IA */}
+      <div className="fixed bottom-24 right-4 z-30 flex items-end gap-2.5 sm:bottom-5 sm:right-5">
+        {audienceMode === "public" && (
+          <CustomSelect
+            id="public-coordinates-fab"
+            title="Subir imagen del cielo o coordenadas"
+            icon={<ImagePlus className="h-5 w-5" />}
+            iconOnly
+            triggerClassName="h-12 w-12 shadow-xl border-black/[.14] bg-background/95 backdrop-blur-md dark:border-white/[.22]"
+            dropUp
+            panelClassName="-right-14 w-[min(20rem,calc(100vw-2rem))] sm:right-0 sm:w-80"
+          >
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <ImagePlus className="h-4 w-4 text-foreground/80" />
+                <h2 className="text-sm font-semibold">Imagen del cielo</h2>
+              </div>
+              <SkyCoordinateSearch
+                compact
+                raInput={raInput}
+                decInput={decInput}
+                radiusInput={radiusInput}
+                inputError={inputError}
+                loadingObservations={loading}
+                solvedImage={solvedSkyImage}
+                onChangeRa={setRaInput}
+                onChangeDec={setDecInput}
+                onChangeRadius={setRadiusInput}
+                onSubmitManual={handleSearchSubmit}
+                onSolvedImage={handleResolvedSkyImage}
+              />
+            </div>
+          </CustomSelect>
+        )}
+
+        <AstronomyChatbot context={chatbotContext} />
+      </div>
     </div>
   );
 }

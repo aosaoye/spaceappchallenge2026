@@ -12,6 +12,7 @@ import {
   Waves,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { apiUrl } from "@/lib/api-config";
 import {
   EstructuraFitsResponse,
   ExtensionFitsInfo,
@@ -90,11 +91,11 @@ export default function FitsScientificInspector({
     try {
       const encoded = encodeURIComponent(urlAcceso);
       const [resEst, resMeta, resImg, resCal] = await Promise.all([
-        fetch(`/api/v1/observaciones/estructura-fits?url_acceso=${encoded}`),
-        fetch(`/api/v1/observaciones/metadatos-fits?url_acceso=${encoded}`),
-        fetch(`/api/v1/observaciones/analisis-fits?url_acceso=${encoded}`),
+        fetch(apiUrl(`/api/v1/observaciones/estructura-fits?url_acceso=${encoded}`)),
+        fetch(apiUrl(`/api/v1/observaciones/metadatos-fits?url_acceso=${encoded}`)),
+        fetch(apiUrl(`/api/v1/observaciones/analisis-fits?url_acceso=${encoded}`)),
         fetch(
-          `/api/v1/observaciones/analisis-calidad-fits?url_acceso=${encoded}`
+          apiUrl(`/api/v1/observaciones/analisis-calidad-fits?url_acceso=${encoded}`)
         ),
       ]);
 
@@ -139,11 +140,11 @@ export default function FitsScientificInspector({
       try {
         const encoded = encodeURIComponent(observacion.url_acceso);
         const [resEst, resMeta, resImg, resCal] = await Promise.all([
-          fetch(`/api/v1/observaciones/estructura-fits?url_acceso=${encoded}`),
-          fetch(`/api/v1/observaciones/metadatos-fits?url_acceso=${encoded}`),
-          fetch(`/api/v1/observaciones/analisis-fits?url_acceso=${encoded}`),
+          fetch(apiUrl(`/api/v1/observaciones/estructura-fits?url_acceso=${encoded}`)),
+          fetch(apiUrl(`/api/v1/observaciones/metadatos-fits?url_acceso=${encoded}`)),
+          fetch(apiUrl(`/api/v1/observaciones/analisis-fits?url_acceso=${encoded}`)),
           fetch(
-            `/api/v1/observaciones/analisis-calidad-fits?url_acceso=${encoded}`
+            apiUrl(`/api/v1/observaciones/analisis-calidad-fits?url_acceso=${encoded}`)
           ),
         ]);
 
@@ -195,14 +196,10 @@ export default function FitsScientificInspector({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <Database className="h-4 w-4 text-foreground/80" />
-          <div>
-            <h2 className="text-sm font-semibold">
-              Inspección científica FITS Multi-Extensión (MEF)
-            </h2>
-            <p className="text-xs text-foreground/60 font-mono">
-              {observacion.identificador} · {observacion.banda_espectral}
-            </p>
-          </div>
+          <h2 className="text-sm font-semibold">Inspector FITS</h2>
+          <span className="font-mono text-xs text-foreground/60">
+            {observacion.identificador}
+          </span>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -216,7 +213,7 @@ export default function FitsScientificInspector({
             }`}
           >
             <Layers className="h-3.5 w-3.5" />
-            <span>Estructura MEF ({estructura.length})</span>
+            <span>Estructura ({estructura.length})</span>
           </button>
           <button
             type="button"
@@ -228,7 +225,7 @@ export default function FitsScientificInspector({
             }`}
           >
             <Compass className="h-3.5 w-3.5" />
-            <span>Cabeceras y WCS (Espacial / LVF)</span>
+            <span>Metadatos y WCS</span>
           </button>
           <button
             type="button"
@@ -240,7 +237,7 @@ export default function FitsScientificInspector({
             }`}
           >
             <Flag className="h-3.5 w-3.5" />
-            <span>Flags L2 y Calibración</span>
+            <span>Flags</span>
           </button>
           <button
             type="button"
@@ -252,13 +249,13 @@ export default function FitsScientificInspector({
             }`}
           >
             <Activity className="h-3.5 w-3.5" />
-            <span>Análisis FITS y Calidad</span>
+            <span>Calidad</span>
           </button>
           <button
             type="button"
             onClick={() => cargarInspeccionFits(observacion.url_acceso)}
             disabled={loading}
-            title="Actualizar inspección FITS"
+            title="Actualizar"
             className="inline-flex h-8 items-center justify-center gap-1 rounded-full border border-black/[.08] px-2.5 text-xs font-medium transition-colors hover:bg-[#f2f2f2] disabled:opacity-50 dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
           >
             <RefreshCw
@@ -269,10 +266,10 @@ export default function FitsScientificInspector({
             href={`https://irsa.ipac.caltech.edu/irsaviewer/`}
             target="_blank"
             rel="noreferrer"
-            title="Abrir visor interactivo IRSA Firefly (Sección 7 de spherex_intro.md)"
+            title="Abrir Firefly"
             className="inline-flex h-8 items-center justify-center gap-1 rounded-full border border-black/[.08] px-3 text-xs font-medium transition-colors hover:bg-[#f2f2f2] dark:border-white/[.145] dark:hover:bg-[#1a1a1a]"
           >
-            <span>Firefly Viewer</span>
+            <span>Firefly</span>
             <ExternalLink className="h-3 w-3" />
           </a>
         </div>
@@ -396,16 +393,12 @@ export default function FitsScientificInspector({
             </dl>
           </div>
 
-          {/* WCS Espectral LVF (Sección 8b y 8c de spherex_intro.md) */}
+          {/* WCS Espectral LVF */}
           <div className="rounded-md border border-black/[.08] p-3 dark:border-white/[.145]">
             <div className="flex items-center gap-1.5 text-xs font-semibold">
               <Waves className="h-3.5 w-3.5" />
-              <span>WCS Espectral LVF (WCS-WAVE · key=&quot;W&quot;)</span>
+              <span>WCS Espectral (LVF)</span>
             </div>
-            <p className="mt-1 text-[11px] text-foreground/65">
-              Filtros lineales variables (LVF) evaluados con{" "}
-              <code className="font-mono">spectral_wcs.sip = None</code>.
-            </p>
             {metadatos.wcs_espectral && (
               <dl className="mt-2 space-y-1 text-xs font-mono">
                 <div className="flex justify-between border-b border-black/[.04] py-0.5 dark:border-white/[.06]">
@@ -523,19 +516,19 @@ export default function FitsScientificInspector({
             {metadatos.resumen_extensiones && (
               <div className="rounded-md border border-black/[.08] p-3 dark:border-white/[.145]">
                 <span className="block text-xs font-semibold">
-                  Extensiones de calibración (Secciones 10–13 de spherex_intro.md)
+                  Calibración
                 </span>
                 <div className="mt-2 grid grid-cols-1 gap-2 font-mono text-[11px] sm:grid-cols-2">
                   <div className="rounded bg-black/[.03] p-2 dark:bg-white/[.04]">
-                    <div className="font-semibold">10. VARIANCE &amp; 11. ZODI</div>
+                    <div className="font-semibold">VARIANCE &amp; ZODI</div>
                     <div className="text-foreground/70">
-                      VARIANCE: 2040×2040 en (MJy/sr)² · ZODI: 2040×2040 en MJy/sr (no sustraído de IMAGE)
+                      2040×2040 (MJy/sr)² · MJy/sr
                     </div>
                   </div>
                   <div className="rounded bg-black/[.03] p-2 dark:bg-white/[.04]">
-                    <div className="font-semibold">12. EPSF &amp; 13. WCS-WAVE</div>
+                    <div className="font-semibold">EPSF &amp; WCS-WAVE</div>
                     <div className="text-foreground/70">
-                      EPSF: 441 regiones (21×21, 33×33 px, OVSMPX/Y=5) · WCS-WAVE: 1 fila [X, Y, VALUES (45×45×2)]
+                      441 regiones · 45×45×2
                     </div>
                   </div>
                 </div>
