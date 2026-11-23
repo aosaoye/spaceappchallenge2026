@@ -31,6 +31,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=obtener_origenes_cors(),
+    allow_origin_regex=r"https://(aosaoye\.github\.io|spaceappchallenge2026(-[a-z0-9-]+)?\.vercel\.app)",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,6 +53,16 @@ class ResolverImagenPayload(BaseModel):
     archivo_base64: str
     nombre_archivo: str = "cielo.png"
     astrometry_api_key: str | None = None
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
+def raiz():
+    """Responde en la raíz para verificaciones de salud por defecto (GET y HEAD /)."""
+    return {
+        "estado": "funcionando",
+        "proyecto": "SPHEREx Explorer",
+        "docs": "/docs",
+    }
 
 
 @app.get("/api/v1/estado")

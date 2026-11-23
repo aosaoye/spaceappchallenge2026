@@ -133,11 +133,23 @@ export async function fetchRegionObservationsData(
     radio: String(radiusArcsec),
     respaldo_hips5: "true",
   });
+  const primaryUrl = apiUrl(`/api/v1/observaciones?${params.toString()}`);
 
-  const primaryRes = await fetch(
-    apiUrl(`/api/v1/observaciones?${params.toString()}`)
-  );
-  if (primaryRes.ok) {
+  const attemptPrimary = async (): Promise<Response | null> => {
+    try {
+      return await fetch(primaryUrl);
+    } catch {
+      return null;
+    }
+  };
+
+  let primaryRes = await attemptPrimary();
+  if (!primaryRes || (primaryRes.status >= 502 && primaryRes.status <= 504)) {
+    await new Promise((r) => setTimeout(r, 2500));
+    primaryRes = await attemptPrimary();
+  }
+
+  if (primaryRes && primaryRes.ok) {
     const data = (await primaryRes.json()) as ObservacionesResponse;
     if (Array.isArray(data.observaciones) && data.observaciones.length > 0) {
       return data;
@@ -148,11 +160,21 @@ export async function fetchRegionObservationsData(
     ascension_recta: raDeg.toFixed(6),
     declinacion: decDeg.toFixed(6),
   });
-  const hipsRes = await fetch(
-    apiUrl(`/api/v1/observaciones/hips5?${hipsParams.toString()}`)
-  );
-  if (hipsRes.ok) {
-    return (await hipsRes.json()) as ObservacionesResponse;
+  try {
+    const hipsRes = await fetch(
+      apiUrl(`/api/v1/observaciones/hips5?${hipsParams.toString()}`)
+    );
+    if (hipsRes.ok) {
+      return (await hipsRes.json()) as ObservacionesResponse;
+    }
+  } catch {
+    // conservar detalle del error principal si tampoco responde HiPS5
+  }
+
+  if (!primaryRes) {
+    throw new Error(
+      "No se pudo conectar con el servidor SPHEREx en Render (puede estar iniciándose; reintenta en unos segundos)."
+    );
   }
 
   let errDetail = `HTTP ${primaryRes.status}`;

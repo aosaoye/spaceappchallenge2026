@@ -20,6 +20,6 @@ def obtener_origenes_cors() -> list[str]:
     """
     valor = os.getenv(
         "SPHEREX_CORS_ORIGINS",
-        "https://aosaoye.github.io,http://localhost:3000,http://127.0.0.1:3000",
+        "https://aosaoye.github.io,https://spaceappchallenge2026.vercel.app,http://localhost:3000,http://127.0.0.1:3000",
     )
     return [origen.strip() for origen in valor.split(",") if origen.strip()]

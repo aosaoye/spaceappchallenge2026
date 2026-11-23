@@ -9,7 +9,7 @@ services:
     autoDeploy: true
     envVars:
       - key: SPHEREX_CORS_ORIGINS
-        value: https://aosaoye.github.io,http://localhost:3000,http://127.0.0.1:3000
+        value: https://aosaoye.github.io,https://spaceappchallenge2026.vercel.app,http://localhost:3000,http://127.0.0.1:3000
       - key: SPHEREX_TRABAJADORES
         value: "1"
       - key: SPHEREX_CACHE_FITS

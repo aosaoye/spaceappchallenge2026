@@ -462,3 +462,10 @@ def test_healpix_nest_5_y_hips5_range(monkeypatch):
     resp_ps1 = cliente.get("/api/v1/observaciones/panstarrs", params={"ra": 133.795, "dec": -7.245})
     assert resp_ps1.status_code == 200
     assert resp_ps1.json()["sizePx"] == 240
+
+    assert cliente.get("/").status_code == 200
+    assert cliente.head("/").status_code == 200
+    for origen in ("https://aosaoye.github.io", "https://spaceappchallenge2026.vercel.app"):
+        cors_resp = cliente.get("/api/v1/estado", headers={"Origin": origen})
+        assert cors_resp.status_code == 200
+        assert cors_resp.headers.get("access-control-allow-origin") == origen
