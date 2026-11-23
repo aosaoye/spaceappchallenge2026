@@ -1,5 +1,6 @@
 """Pruebas unitarias aisladas para la API y el backend SPHEREx."""
 
+import base64
 import io
 import sys
 import threading
@@ -227,3 +228,237 @@ def test_error_irsa_devuelve_502(monkeypatch):
     monkeypatch.setattr(main.buscar_observaciones, "ejecutar", lambda **kwargs: (_ for _ in ()).throw(ErrorIRSA("IRSA no disponible")))
     respuesta = cliente.get("/api/v1/observaciones?ascension_recta=10&declinacion=0")
     assert respuesta.status_code == 502
+
+
+def _fits_con_wcs_bytes(ra: float = 133.795, dec: float = -7.245) -> bytes:
+    """Construye un archivo FITS mínimo con cabecera WCS celestial válida para pruebas."""
+    cabecera = fits.Header()
+    cabecera["OBJECT"] = "WISE 0855"
+    cabecera["CTYPE1"] = "RA---TAN"
+    cabecera["CTYPE2"] = "DEC--TAN"
+    cabecera["CRPIX1"] = 10.5
+    cabecera["CRPIX2"] = 10.5
+    cabecera["CRVAL1"] = ra
+    cabecera["CRVAL2"] = dec
+    cabecera["CDELT1"] = -2.0 / 3600.0
+    cabecera["CDELT2"] = 2.0 / 3600.0
+    hdu = fits.PrimaryHDU(np.ones((20, 20), dtype=np.float32), header=cabecera)
+    salida = io.BytesIO()
+    fits.HDUList([hdu]).writeto(salida)
+    return salida.getvalue()
+
+
+def test_resolver_coordenadas_fits_wcs_local():
+    """Comprueba que un FITS con cabecera WCS se resuelve localmente sin API externa."""
+    repo = RepositorioIrsa()
+    res = repo.resolver_coordenadas_imagen(_fits_con_wcs_bytes(133.795, -7.245), "muestra.fits")
+    assert res["metodo"] == "fits-wcs"
+    assert abs(res["ra_deg"] - 133.795) < 0.01
+    assert abs(res["dec_deg"] - (-7.245)) < 0.01
+    assert res["pixscale_arcsec"] == pytest.approx(2.0, rel=1e-2)
+    assert res["objeto_detectado"] == "WISE 0855"
+
+
+def test_resolver_imagen_jpg_sin_clave_astrometry(monkeypatch):
+    """Comprueba el mensaje claro cuando se sube JPG/PNG sin ASTROMETRY_API_KEY."""
+    monkeypatch.delenv("ASTROMETRY_API_KEY", raising=False)
+    monkeypatch.delenv("SPHEREX_ASTROMETRY_API_KEY", raising=False)
+    cliente = TestClient(main.app)
+    resp = cliente.post(
+        "/api/v1/observaciones/resolver-imagen",
+        json={
+            "archivo_base64": base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode("ascii"),
+            "nombre_archivo": "orion.png",
+        },
+    )
+    assert resp.status_code == 400
+    assert "ASTROMETRY_API_KEY" in resp.json()["detail"]
+
+
+def test_resolver_imagen_astrometry_simulado(monkeypatch):
+    """Comprueba el flujo completo de plate solving con Astrometry.net simulado."""
+    repo = RepositorioIrsa()
+    monkeypatch.setattr(repo, "_astrometry_post_json", lambda url, payload: {"status": "success", "session": "ses-1"})
+    monkeypatch.setattr(repo, "_astrometry_subir_archivo", lambda *args, **kwargs: {"status": "success", "subid": 42})
+
+    def fake_get(url: str) -> dict:
+        if url.endswith("/submissions/42"):
+            return {"jobs": [777]}
+        if url.endswith("/jobs/777"):
+            return {"status": "success"}
+        if url.endswith("/jobs/777/calibration/"):
+            return {"ra": 83.822, "dec": -5.391, "radius": 0.05, "pixscale": 1.2, "orientation": 15.0}
+        if url.endswith("/jobs/777/objects_in_field/"):
+            return {"objects_in_field": ["M 42", "NGC 1976"]}
+        return {}
+
+    monkeypatch.setattr(repo, "_astrometry_get_json", fake_get)
+    res = repo.resolver_coordenadas_imagen(b"fake-jpg", "orion.jpg", astrometry_api_key="test-key")
+    assert res["metodo"] == "astrometry.net"
+    assert res["ra_deg"] == pytest.approx(83.822, abs=1e-4)
+    assert res["dec_deg"] == pytest.approx(-5.391, abs=1e-4)
+    assert res["fov_arcsec"] == pytest.approx(360.0, rel=1e-2)
+    assert res["objetos_en_campo"] == ["M 42", "NGC 1976"]
+
+    cliente = TestClient(main.app)
+    monkeypatch.setattr(main.resolver_coordenadas_imagen, "ejecutar", lambda **kwargs: res)
+    resp = cliente.post(
+        "/api/v1/observaciones/resolver-imagen",
+        json={
+            "archivo_base64": base64.b64encode(_fits_con_wcs_bytes()).decode("ascii"),
+            "nombre_archivo": "orion.fits",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["metodo"] == "astrometry.net"
+
+
+def test_obtener_recorte_fits_wcs_real(monkeypatch):
+    """Verifica que obtener_recorte_fits extrae flujo real centrado por WCS desde IMAGE."""
+    cabecera = fits.Header()
+    cabecera["OBSID"] = "2025W19_TEST"
+    cabecera["DETECTOR"] = 2
+    cabecera["BUNIT"] = "MJy/sr"
+    cabecera["CTYPE1"] = "RA---TAN"
+    cabecera["CTYPE2"] = "DEC--TAN"
+    cabecera["CRPIX1"] = 41.0
+    cabecera["CRPIX2"] = 41.0
+    cabecera["CRVAL1"] = 133.795
+    cabecera["CRVAL2"] = -7.245
+    cabecera["CDELT1"] = -6.0 / 3600.0
+    cabecera["CDELT2"] = 6.0 / 3600.0
+
+    imagen = np.ones((81, 81), dtype=np.float32)
+    imagen[40, 40] = 120.0
+    imagen[39:42, 39:42] = np.maximum(imagen[39:42, 39:42], 40.0)
+
+    repo = RepositorioIrsa()
+    monkeypatch.setattr(repo, "descargar_fits", lambda url: fits.HDUList([fits.PrimaryHDU(imagen.copy(), header=cabecera.copy())]))
+
+    res = repo.obtener_recorte_fits(
+        url_fits="https://irsa.test/spherex.fits",
+        ascension_recta=133.795,
+        declinacion=-7.245,
+        fov_arcsec=180.0,
+        tamano_px=64,
+    )
+    assert res["cobertura_wcs"] is True
+    assert res["ancho"] == 64
+    assert res["alto"] == 64
+    assert res["unidad"] == "MJy/sr"
+    arr = np.frombuffer(base64.b64decode(res["datos_f32_b64"]), dtype="<f4").reshape(res["alto"], res["ancho"])
+    assert float(arr[32, 32]) > 35.0
+    assert float(arr[2, 2]) == pytest.approx(1.0, abs=0.05)
+
+
+def test_obtener_recorte_fits_sin_solapamiento_y_endpoint(monkeypatch):
+    """Comprueba respaldo de cuadro completo cuando WCS no solapa y el endpoint HTTP."""
+    repo = RepositorioIrsa()
+    monkeypatch.setattr(repo, "descargar_fits", lambda url: fits.open(io.BytesIO(_fits_con_wcs_bytes(133.795, -7.245)), memmap=False))
+
+    res = repo.obtener_recorte_fits(
+        url_fits="https://irsa.test/lejano.fits",
+        ascension_recta=10.0,
+        declinacion=45.0,
+        fov_arcsec=120.0,
+        tamano_px=64,
+    )
+    assert res["cobertura_wcs"] is False
+    assert res["pixeles_validos"] == 400
+
+    cliente = TestClient(main.app)
+    monkeypatch.setattr(main.extraer_recorte_fits, "ejecutar", lambda **kwargs: res)
+    resp = cliente.get(
+        "/api/v1/observaciones/recorte-fits",
+        params={"fits_url": "https://irsa.test/lejano.fits", "ra": 133.795, "dec": -7.245},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["pixeles_validos"] == 400
+
+
+def _cubo_hips5_bytes() -> bytes:
+    """Construye un cubo HiPS5 3D (2 planos x 8 x 8) compatible con Range FITS en pruebas."""
+    hdr0 = fits.Header()
+    hdr0["TELESCOP"] = "SPHEREx"
+    hdr0["DATE-BEG"] = "2025-08-05T06:05:48.769"
+    hdr0["DATE-END"] = "2026-02-18T04:49:11.887"
+    hdr0["MJD-BEG"] = 60892.25
+    hdr0["MJD-END"] = 61089.20
+    hdr0["BLANKCH"] = "D3:17,D4:01"
+
+    hdr1 = fits.Header()
+    hdr1["CTYPE1"] = "RA---HPX"
+    hdr1["CTYPE2"] = "DEC--HPX"
+    hdr1["CRPIX1"] = 4.5
+    hdr1["CRPIX2"] = 4.5
+    hdr1["PC1_1"] = -0.01
+    hdr1["PC1_2"] = -0.01
+    hdr1["PC2_1"] = 0.01
+    hdr1["PC2_2"] = -0.01
+    hdr1["CDELT1"] = 1.0
+    hdr1["CDELT2"] = 1.0
+    hdr1["CUNIT1"] = "deg"
+    hdr1["CUNIT2"] = "deg"
+    hdr1["CRVAL1"] = 0.0
+    hdr1["CRVAL2"] = 0.0
+    hdr1["PV2_1"] = 4.0
+    hdr1["PV2_2"] = 3.0
+    hdr1["LONPOLE"] = 0.0
+    hdr1["LATPOLE"] = 90.0
+    hdr1["NPIX"] = 10226
+    hdr1["BUNIT"] = "MJy/sr"
+
+    cubo = np.full((2, 8, 8), 1.5, dtype=np.float32)
+    cubo[1, 3, 4] = 42.0
+    salida = io.BytesIO()
+    fits.HDUList([fits.PrimaryHDU(header=hdr0), fits.ImageHDU(cubo, header=hdr1, name="IMAGE")]).writeto(salida)
+    return salida.getvalue()
+
+
+def test_healpix_nest_5_y_hips5_range(monkeypatch):
+    """Comprueba cálculo HEALPix orden 5, extracción por Range y endpoint /hips5."""
+    repo = RepositorioIrsa()
+    assert repo._radec_a_healpix_nest_5(133.795129, -7.245147) == 10226
+    assert repo._radec_a_healpix_nest_5(248.167625, 66.754972) == 2928
+    assert 0 <= repo._radec_a_healpix_nest_5(359.99, -89.9) < 12288
+
+    datos_cubo = _cubo_hips5_bytes()
+    monkeypatch.setattr(repo, "_descargar_rango_http", lambda url, ini, fin: datos_cubo[ini : fin + 1])
+
+    obs_hips = repo.buscar_cubo_hips5(133.795129, -7.245147)
+    assert len(obs_hips) == 6
+    assert obs_hips[0].coleccion == "spherex_dr1_hips5"
+    assert "#plane=" in obs_hips[0].url_acceso
+
+    url_p1 = "https://irsa.ipac.caltech.edu/ibe/data/spherex/dr1/hips5_cube/hips_20261026/Norder5/Dir10000/Npix10226_cube.fits#plane=1"
+    fits_2d = repo._descargar_bytes_fits_worker(url_p1, None)
+    with fits.open(io.BytesIO(fits_2d), memmap=False) as hdul:
+        assert "IMAGE" in hdul
+        assert hdul["IMAGE"].data.shape == (8, 8)
+        assert float(hdul["IMAGE"].data[3, 4]) == pytest.approx(42.0)
+        assert "CTYPE3" not in hdul["IMAGE"].header
+
+    cliente = TestClient(main.app)
+    monkeypatch.setattr(main.buscar_cubo_hips5, "ejecutar", lambda **kwargs: obs_hips)
+    resp = cliente.get("/api/v1/observaciones/hips5", params={"ascension_recta": 133.795, "declinacion": -7.245})
+    assert resp.status_code == 200
+    assert resp.json()["fuente"] == "spherex_dr1_hips5"
+    assert resp.json()["total"] == 6
+
+    monkeypatch.setattr(
+        main.buscar_observaciones,
+        "ejecutar",
+        lambda **kwargs: (_ for _ in ()).throw(ErrorIRSA("SIA 502")),
+    )
+    resp_auto = cliente.get(
+        "/api/v1/observaciones",
+        params={"ascension_recta": 133.795, "declinacion": -7.245, "radio": 60, "respaldo_hips5": "true"},
+    )
+    assert resp_auto.status_code == 200
+    assert resp_auto.json()["fuente"] == "spherex_dr1_hips5"
+
+    ps1_mock = {"ra": 133.795, "dec": -7.245, "fovArcsec": 60.0, "sizePx": 240, "type": "stack", "colorUrl": None, "ps1CutoutsWebUrl": "https://ps1images.stsci.edu/", "items": []}
+    monkeypatch.setattr(main.consultar_panstarrs, "ejecutar", lambda **kwargs: ps1_mock)
+    resp_ps1 = cliente.get("/api/v1/observaciones/panstarrs", params={"ra": 133.795, "dec": -7.245})
+    assert resp_ps1.status_code == 200
+    assert resp_ps1.json()["sizePx"] == 240

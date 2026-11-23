@@ -1,3 +1,4 @@
+const DEFAULT_RENDER_API_URL = "https://spaceappchallenge2026.onrender.com";
 const BACKEND_STORAGE_KEY = "spherex-backend-url";
 
 function normalizeOriginUrl(raw: string): string {
@@ -51,7 +52,9 @@ export function getApiBaseUrl(): string {
     }
   }
 
-  return normalizeOriginUrl(process.env.NEXT_PUBLIC_API_URL || "");
+  return normalizeOriginUrl(
+    process.env.NEXT_PUBLIC_API_URL || DEFAULT_RENDER_API_URL
+  );
 }
 
 export function apiUrl(path: string): string {

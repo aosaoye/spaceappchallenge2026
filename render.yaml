@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: spaceappchallenge2026
+    runtime: docker
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /api/v1/estado
+    autoDeploy: true
+    envVars:
+      - key: SPHEREX_CORS_ORIGINS
+        value: https://aosaoye.github.io,http://localhost:3000,http://127.0.0.1:3000
+      - key: SPHEREX_TRABAJADORES
+        value: "1"
+      - key: SPHEREX_CACHE_FITS
+        value: "1"
+      - key: SPHEREX_CACHE_FITS_BYTES
+        value: "134217728"
+      - key: SPHEREX_CACHE_PNG
+        value: "4"
+      - key: SPHEREX_CACHE_RECORTES
+        value: "16"
+      - key: SPHEREX_TIMEOUT_DESCARGA
+        value: "60"
+      - key: SPHEREX_LOG_LEVEL
+        value: INFO
+      - key: SPHEREX_ASTROMETRY_API_KEY
+        sync: false

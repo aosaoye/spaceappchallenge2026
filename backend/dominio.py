@@ -42,6 +42,17 @@ class RepositorioObservaciones(Protocol):
         """
         ...
 
+    def buscar_cubo_hips5(
+        self,
+        ascension_recta: float,
+        declinacion: float
+    ) -> list[Observacion]:
+        """
+        Resuelve las bandas científicas disponibles en los cubos espectrales HiPS5 de SPHEREx DR1
+        para una coordenada (RA, Dec) como respaldo directo ante indisponibilidad o vacío de SIA.
+        """
+        ...
+
     def obtener_estructura_fits(
         self,
         url_acceso: str
@@ -90,5 +101,45 @@ class RepositorioObservaciones(Protocol):
         """
         Descarga o lee un producto FITS de SPHEREx y lo convierte en PNG.
         Soporta modo 'flujo' (AsinhStretch) y 'longitud_onda' (mapa WCS-WAVE).
+        """
+        ...
+
+    def resolver_coordenadas_imagen(
+        self,
+        contenido: bytes,
+        nombre_archivo: str,
+        astrometry_api_key: str | None = None
+    ) -> dict:
+        """
+        Extrae coordenadas celestes (RA, Dec, FOV) a partir de una imagen del cielo.
+        Utiliza cabecera WCS local en archivos FITS o plate solving mediante Astrometry.net.
+        """
+        ...
+
+    def obtener_recorte_fits(
+        self,
+        url_fits: str,
+        ascension_recta: float | None = None,
+        declinacion: float | None = None,
+        fov_arcsec: float = 600.0,
+        tamano_px: int = 280
+    ) -> dict:
+        """
+        Extrae un recorte numérico real de la extensión IMAGE de un archivo FITS,
+        reproyectado al plano tangente celeste cuando el WCS cubre la región solicitada,
+        y codificado en float32 base64 para el reproductor interactivo.
+        """
+        ...
+
+    def consultar_panstarrs(
+        self,
+        ascension_recta: float,
+        declinacion: float,
+        fov_arcsec: float = 60.0,
+        tipo_archivo: str = "stack"
+    ) -> dict:
+        """
+        Consulta recortes ópticos Pan-STARRS1 DR2 en el servicio de STScI.
+        Devuelve filtros disponibles y URLs de recorte FITS/JPG sin problemas CORS.
         """
         ...

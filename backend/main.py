@@ -1,12 +1,22 @@
+import base64
+import binascii
 import logging
 import os
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from aplicacion import BuscarObservaciones, ConvertirFitsAPng
+from aplicacion import (
+    BuscarCuboHips5,
+    BuscarObservaciones,
+    ConsultarPanStarrs,
+    ConvertirFitsAPng,
+    ExtraerRecorteFits,
+    ResolverCoordenadasImagen,
+)
 from configuracion import obtener_origenes_cors
-from infraestructura import ErrorIRSA, RepositorioIrsa
+from infraestructura import ErrorAstrometry, ErrorIRSA, RepositorioIrsa
 
 logger = logging.getLogger(__name__)
 nivel_logging = getattr(logging, os.getenv("SPHEREX_LOG_LEVEL", "INFO").upper(), logging.INFO)
@@ -29,7 +39,19 @@ app.add_middleware(
 # Inyección de dependencias
 repositorio = RepositorioIrsa()
 buscar_observaciones = BuscarObservaciones(repositorio)
+buscar_cubo_hips5 = BuscarCuboHips5(repositorio)
+consultar_panstarrs = ConsultarPanStarrs(repositorio)
 convertir_fits_a_png = ConvertirFitsAPng(repositorio)
+extraer_recorte_fits = ExtraerRecorteFits(repositorio)
+resolver_coordenadas_imagen = ResolverCoordenadasImagen(repositorio)
+
+
+class ResolverImagenPayload(BaseModel):
+    """Cuerpo JSON para resolver coordenadas a partir de una imagen en base64."""
+
+    archivo_base64: str
+    nombre_archivo: str = "cielo.png"
+    astrometry_api_key: str | None = None
 
 
 @app.get("/api/v1/estado")
@@ -49,7 +71,11 @@ def obtener_estado():
 def obtener_observaciones(
     ascension_recta: float = Query(..., ge=0, le=360),
     declinacion: float = Query(..., ge=-90, le=90),
-    radio: float = Query(1, gt=0, le=3600)
+    radio: float = Query(1, gt=0, le=3600),
+    respaldo_hips5: bool = Query(
+        False,
+        description="Si es true, recurre automáticamente a SPHEREx DR1 HiPS5 cuando SIA falla o devuelve vacío.",
+    ),
 ):
     """
     Busca productos SPHEREx alrededor de unas coordenadas.
@@ -62,14 +88,87 @@ def obtener_observaciones(
             declinacion=declinacion,
             radio=radio
         )
+        if respaldo_hips5 and not resultados:
+            hips_resultados = buscar_cubo_hips5.ejecutar(
+                ascension_recta=ascension_recta,
+                declinacion=declinacion,
+            )
+            return {
+                "total": len(hips_resultados),
+                "fuente": "spherex_dr1_hips5",
+                "observaciones": hips_resultados,
+            }
 
         return {
             "total": len(resultados),
             "observaciones": resultados
         }
 
+    except ErrorIRSA as error:
+        if respaldo_hips5:
+            try:
+                hips_resultados = buscar_cubo_hips5.ejecutar(
+                    ascension_recta=ascension_recta,
+                    declinacion=declinacion,
+                )
+                return {
+                    "total": len(hips_resultados),
+                    "fuente": "spherex_dr1_hips5",
+                    "observaciones": hips_resultados,
+                }
+            except Exception:
+                pass
+        raise _http_error(error, "consultar IRSA") from error
     except Exception as error:
         raise _http_error(error, "consultar IRSA") from error
+
+
+@app.get("/api/v1/observaciones/hips5")
+def obtener_observaciones_hips5(
+    ascension_recta: float = Query(..., ge=0, le=360),
+    declinacion: float = Query(..., ge=-90, le=90)
+):
+    """
+    Resuelve directamente productos espectrales reales de SPHEREx DR1 (cubos HiPS5 Norder=5)
+    para unas coordenadas (RA, Dec) mediante acceso directo IBE/S3 sin depender del proxy SIA/TAP.
+    """
+
+    try:
+        resultados = buscar_cubo_hips5.ejecutar(
+            ascension_recta=ascension_recta,
+            declinacion=declinacion,
+        )
+        return {
+            "total": len(resultados),
+            "fuente": "spherex_dr1_hips5",
+            "observaciones": resultados,
+        }
+    except Exception as error:
+        raise _http_error(error, "consultar el archivo HiPS5 de SPHEREx DR1") from error
+
+
+@app.get("/api/v1/observaciones/panstarrs")
+def obtener_panstarrs(
+    ra: float = Query(..., ge=0, le=360),
+    dec: float = Query(..., ge=-90, le=90),
+    fov_arcsec: float = Query(60.0, gt=0, le=3600),
+    type: str = Query("stack", description="Tipo de producto Pan-STARRS1: 'stack' o 'warp'")
+):
+    """
+    Consulta imágenes ópticas de comparación Pan-STARRS1 DR2 desde el backend.
+    """
+
+    try:
+        return consultar_panstarrs.ejecutar(
+            ascension_recta=ra,
+            declinacion=dec,
+            fov_arcsec=fov_arcsec,
+            tipo_archivo=type,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        raise _http_error(error, "consultar Pan-STARRS1") from error
 
 
 @app.get("/api/v1/observaciones/estructura-fits")
@@ -212,6 +311,67 @@ def obtener_imagen_observacion(
         raise _http_error(error, "convertir el FITS a PNG") from error
 
 
+@app.get("/api/v1/observaciones/recorte-fits")
+def obtener_recorte_fits(
+    fits_url: str = Query(..., description="URL del archivo FITS de SPHEREx"),
+    ra: float | None = Query(None, ge=0, le=360, description="Ascensión Recta central en grados"),
+    dec: float | None = Query(None, ge=-90, le=90, description="Declinación central en grados"),
+    fov_arcsec: float = Query(600.0, gt=10, le=14400, description="Campo de visión solicitado en arcosegundos"),
+    tamano_px: int = Query(280, ge=64, le=384, description="Resolución máxima de la matriz de salida")
+):
+    """
+    Extrae un recorte real en float32 desde la extensión IMAGE de un FITS,
+    alineado al cielo mediante su WCS para alimentar el visor interactivo.
+    """
+
+    try:
+        return extraer_recorte_fits.ejecutar(
+            url_fits=fits_url,
+            ascension_recta=ra,
+            declinacion=dec,
+            fov_arcsec=fov_arcsec,
+            tamano_px=tamano_px,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+    except Exception as error:
+        raise _http_error(error, "extraer el recorte FITS") from error
+
+
+@app.post("/api/v1/observaciones/resolver-imagen")
+def resolver_imagen_cielo(payload: ResolverImagenPayload):
+    """
+    Extrae coordenadas celestes (RA, Dec, FOV) a partir de una imagen FITS, JPG o PNG.
+    """
+
+    try:
+        datos_b64 = payload.archivo_base64.strip()
+        if "," in datos_b64 and datos_b64.startswith("data:"):
+            datos_b64 = datos_b64.split(",", 1)[1]
+        if len(datos_b64) > 36_000_000:
+            raise ValueError("La imagen supera el tamaño máximo permitido (25 MB).")
+        try:
+            contenido = base64.b64decode(datos_b64, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise ValueError("El contenido de imagen base64 no es válido.") from error
+
+        return resolver_coordenadas_imagen.ejecutar(
+            contenido=contenido,
+            nombre_archivo=payload.nombre_archivo,
+            astrometry_api_key=payload.astrometry_api_key,
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+    except Exception as error:
+        raise _http_error(error, "resolver las coordenadas de la imagen") from error
+
+
 def _http_error(error: Exception, operacion: str) -> HTTPException:
     """Traduce errores de infraestructura a códigos HTTP adecuados.
     Devuelve una excepción HTTP con un estado que distingue validación, ausencia, servicio externo y fallo interno.
@@ -224,7 +384,7 @@ def _http_error(error: Exception, operacion: str) -> HTTPException:
         return HTTPException(status_code=404, detail="El recurso solicitado no existe.")
     if isinstance(error, TimeoutError):
         return HTTPException(status_code=504, detail=f"Tiempo agotado al {operacion}.")
-    if isinstance(error, ErrorIRSA):
+    if isinstance(error, (ErrorIRSA, ErrorAstrometry)):
         return HTTPException(status_code=502, detail=str(error))
     logger.exception("Error interno al %s.", operacion, exc_info=error)
     return HTTPException(status_code=500, detail=f"Error interno al {operacion}.")
