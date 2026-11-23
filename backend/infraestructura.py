@@ -4,6 +4,7 @@ Deduplica descargas FITS simultáneas y protege las cachés y el renderizado con
 """
 
 import base64
+import gc
 import http.client
 import copy
 import io
@@ -25,10 +26,6 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, HTTPSHandler, urlopen
 
 import certifi
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 from astropy import units as u
 from astropy.coordinates import SkyCoord
@@ -117,7 +114,7 @@ class RepositorioIrsa:
         self._max_cache_imagenes = max_cache_imagenes or obtener_entero("SPHEREX_CACHE_PNG", 8)
         self._max_cache_fits = max_cache_fits or obtener_entero("SPHEREX_CACHE_FITS", 2)
         self._max_bytes_fits = obtener_entero("SPHEREX_MAX_FITS_BYTES", 536870912)
-        self._max_bytes_cache_fits = obtener_entero("SPHEREX_CACHE_FITS_BYTES", 536870912)
+        self._max_bytes_cache_fits = obtener_entero("SPHEREX_CACHE_FITS_BYTES", 25165824)
         self._timeout_descarga = obtener_entero("SPHEREX_TIMEOUT_DESCARGA", 90)
         self._max_bytes_resolver = obtener_entero("SPHEREX_MAX_UPLOAD_SOLVE_BYTES", 26214400)
         self._timeout_astrometry = obtener_entero("SPHEREX_ASTROMETRY_TIMEOUT", 90)
@@ -126,6 +123,9 @@ class RepositorioIrsa:
             "https://nova.astrometry.net/api",
         ).rstrip("/")
         self._lock = threading.RLock()
+        self._semaforo_recortes = threading.BoundedSemaphore(
+            obtener_entero("SPHEREX_CONCURRENCIA_RECORTES", 2)
+        )
         self._vuelos_fits: dict[str, Future[bytes]] = {}
         self._cache_png: OrderedDict[str, bytes] = OrderedDict()
         self._cache_recortes: OrderedDict[str, dict] = OrderedDict()
@@ -1341,6 +1341,11 @@ class RepositorioIrsa:
                 extent = None
 
             with _MATPLOTLIB_LOCK:
+                import matplotlib
+
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
                 fig, ax = plt.subplots(figsize=(7.5, 7.5))
                 try:
                     im = ax.imshow(
@@ -1477,6 +1482,35 @@ class RepositorioIrsa:
         # Invierte filas para que fila 0 sea el Norte (arriba en canvas HTML5) y col 0 el Este (izquierda).
         return recorte[::-1, :]
 
+    def _descargar_recorte_ibe_fits(
+        self,
+        url_limpia: str,
+        ra_deg: float,
+        dec_deg: float,
+        fov_arcsec: float,
+    ) -> fits.HDUList | None:
+        """
+        Solicita a IRSA IBE un recorte espacial acotado (?center=RA,DEC&size=DEG)
+        para reducir de ~66 MB a ~2-5 MB los FITS Level-2 en memoria.
+        Devuelve None si IRSA rechaza el recorte o si la coordenada no solapa el detector.
+        """
+        size_deg = max(0.08, min(2.5, (fov_arcsec * 1.35) / 3600.0))
+        url_recorte = f"{url_limpia}?center={ra_deg:.6f},{dec_deg:.6f}&size={size_deg:.4f}"
+        opener = self._construir_opener_seguro()
+        max_bytes = min(self._max_bytes_fits, 41_943_040)
+        try:
+            req = Request(url_recorte, headers={"User-Agent": "SPHEREx-Explorer/1.0"})
+            with opener.open(req, timeout=min(self._timeout_descarga, 35)) as resp:
+                largo = resp.headers.get("Content-Length")
+                if largo and int(largo) > max_bytes:
+                    return None
+                contenido = resp.read(max_bytes + 1)
+                if len(contenido) > max_bytes or not contenido.startswith(b"SIMPLE  "):
+                    return None
+                return fits.open(BytesIO(contenido), memmap=False)
+        except (urllib.error.HTTPError, TimeoutError, urllib.error.URLError, http.client.HTTPException, OSError):
+            return None
+
     def obtener_recorte_fits(
         self,
         url_fits: str,
@@ -1509,106 +1543,126 @@ class RepositorioIrsa:
                 self._cache_recortes.move_to_end(clave_cache)
                 return dict(self._cache_recortes[clave_cache])
 
-        hdul = self.descargar_fits(url_limpia)
-        try:
-            ext_imagen = hdul["IMAGE"] if "IMAGE" in hdul else hdul[0]
-            if ext_imagen.data is None or np.ndim(ext_imagen.data) != 2:
-                raise ValueError("La extensión IMAGE debe contener una matriz bidimensional.")
+        es_nivel2_ibe = (
+            url_limpia.startswith("https://irsa.ipac.caltech.edu/ibe/data/spherex/")
+            and "#" not in url_limpia
+            and "?" not in url_limpia
+            and "/hips5_cube/" not in url_limpia
+            and ra_norm is not None
+            and dec_norm is not None
+        )
 
-            header = ext_imagen.header.copy()
-            data = np.asarray(ext_imagen.data, dtype=np.float32)
-            ny, nx = data.shape
-
-            wcs_in: WCS | None = None
-            native_scale_arcsec = 6.2
+        with self._semaforo_recortes:
+            hdul = (
+                self._descargar_recorte_ibe_fits(url_limpia, ra_norm, dec_norm, fov)
+                if es_nivel2_ibe
+                else None
+            )
+            if hdul is None:
+                hdul = self.descargar_fits(url_limpia)
+            data = None
             try:
-                candidato = WCS(header, relax=True).celestial
-                if candidato.has_celestial:
-                    wcs_in = candidato
-                    scales = proj_plane_pixel_scales(candidato)
-                    mean_deg = float(np.nanmean(scales))
-                    if np.isfinite(mean_deg) and mean_deg > 0:
-                        native_scale_arcsec = mean_deg * 3600.0
-            except Exception:
-                wcs_in = None
+                ext_imagen = hdul["IMAGE"] if "IMAGE" in hdul else hdul[0]
+                if ext_imagen.data is None or np.ndim(ext_imagen.data) != 2:
+                    raise ValueError("La extensión IMAGE debe contener una matriz bidimensional.")
 
-            recorte: np.ndarray | None = None
-            cobertura_wcs = False
-            ra_resultado = ra_norm if ra_norm is not None else 0.0
-            dec_resultado = dec_norm if dec_norm is not None else 0.0
-            fov_resultado = fov
+                header = ext_imagen.header.copy()
+                data = np.asarray(ext_imagen.data, dtype=np.float32)
+                ny, nx = data.shape
 
-            if wcs_in is not None and ra_norm is not None and dec_norm is not None:
-                recorte = self._remuestrear_wcs_tangente(
-                    data=data,
-                    wcs_in=wcs_in,
-                    ra_centro=ra_norm,
-                    dec_centro=dec_norm,
-                    fov_arcsec=fov,
-                    tamano_px=tamano,
-                    native_scale_arcsec=native_scale_arcsec,
-                )
-                if recorte is not None:
-                    cobertura_wcs = True
+                wcs_in: WCS | None = None
+                native_scale_arcsec = 6.2
+                try:
+                    candidato = WCS(header, relax=True).celestial
+                    if candidato.has_celestial:
+                        wcs_in = candidato
+                        scales = proj_plane_pixel_scales(candidato)
+                        mean_deg = float(np.nanmean(scales))
+                        if np.isfinite(mean_deg) and mean_deg > 0:
+                            native_scale_arcsec = mean_deg * 3600.0
+                except Exception:
+                    wcs_in = None
 
-            if recorte is None:
-                paso_y = max(1, int(np.ceil(ny / tamano)))
-                paso_x = max(1, int(np.ceil(nx / tamano)))
-                reducida = self._reducir_por_bloques(data, paso_y, paso_x)
-                recorte = reducida[::-1, :]
-                fov_resultado = float(max(ny, nx) * native_scale_arcsec)
-                if wcs_in is not None:
-                    try:
-                        ra_c, dec_c = wcs_in.pixel_to_world_values((nx - 1) / 2.0, (ny - 1) / 2.0)
-                        if np.isfinite(ra_c) and np.isfinite(dec_c):
-                            ra_resultado = float(ra_c) % 360.0
-                            dec_resultado = float(dec_c)
-                    except Exception:
-                        pass
+                recorte: np.ndarray | None = None
+                cobertura_wcs = False
+                ra_resultado = ra_norm if ra_norm is not None else 0.0
+                dec_resultado = dec_norm if dec_norm is not None else 0.0
+                fov_resultado = fov
 
-            valid_pixels = recorte[np.isfinite(recorte)]
-            if valid_pixels.size == 0:
-                raise ValueError("La extensión IMAGE no contiene píxeles válidos.")
+                if wcs_in is not None and ra_norm is not None and dec_norm is not None:
+                    recorte = self._remuestrear_wcs_tangente(
+                        data=data,
+                        wcs_in=wcs_in,
+                        ra_centro=ra_norm,
+                        dec_centro=dec_norm,
+                        fov_arcsec=fov,
+                        tamano_px=tamano,
+                        native_scale_arcsec=native_scale_arcsec,
+                    )
+                    if recorte is not None:
+                        cobertura_wcs = True
 
-            vmin, vmax = np.percentile(valid_pixels, [1.0, 99.5])
-            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-                vmin = float(np.min(valid_pixels))
-                vmax = float(vmin + 1e-6)
-            mediana = float(np.median(valid_pixels))
-            ruido_mad = float(np.median(np.abs(valid_pixels - mediana)))
+                if recorte is None:
+                    paso_y = max(1, int(np.ceil(ny / tamano)))
+                    paso_x = max(1, int(np.ceil(nx / tamano)))
+                    reducida = self._reducir_por_bloques(data, paso_y, paso_x)
+                    recorte = reducida[::-1, :]
+                    fov_resultado = float(max(ny, nx) * native_scale_arcsec)
+                    if wcs_in is not None:
+                        try:
+                            ra_c, dec_c = wcs_in.pixel_to_world_values((nx - 1) / 2.0, (ny - 1) / 2.0)
+                            if np.isfinite(ra_c) and np.isfinite(dec_c):
+                                ra_resultado = float(ra_c) % 360.0
+                                dec_resultado = float(dec_c)
+                        except Exception:
+                            pass
 
-            alto_out, ancho_out = recorte.shape
-            datos_bytes = np.ascontiguousarray(recorte, dtype="<f4").tobytes()
-            datos_b64 = base64.b64encode(datos_bytes).decode("ascii")
+                valid_pixels = recorte[np.isfinite(recorte)]
+                if valid_pixels.size == 0:
+                    raise ValueError("La extensión IMAGE no contiene píxeles válidos.")
 
-            detector_val = header.get("DETECTOR")
-            if isinstance(detector_val, (int, np.integer)):
-                detector: int | str = int(detector_val)
-            elif isinstance(detector_val, str) and detector_val.isdigit():
-                detector = int(detector_val)
-            else:
-                detector = str(detector_val or "")
+                vmin, vmax = np.percentile(valid_pixels, [1.0, 99.5])
+                if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                    vmin = float(np.min(valid_pixels))
+                    vmax = float(vmin + 1e-6)
+                mediana = float(np.median(valid_pixels))
+                ruido_mad = float(np.median(np.abs(valid_pixels - mediana)))
 
-            resultado = {
-                "identificador": str(header.get("OBSID", header.get("OBS_ID", "SPHEREx"))),
-                "detector": detector,
-                "unidad": str(header.get("BUNIT", "MJy/sr")),
-                "ancho": int(ancho_out),
-                "alto": int(alto_out),
-                "vmin": float(vmin),
-                "vmax": float(vmax),
-                "mediana": mediana,
-                "ruido_mad": ruido_mad,
-                "ra_centro": float(ra_resultado),
-                "dec_centro": float(dec_resultado),
-                "fov_arcsec": float(fov_resultado),
-                "pixscale_arcsec": float(fov_resultado / max(ancho_out, alto_out)),
-                "cobertura_wcs": bool(cobertura_wcs),
-                "pixeles_validos": int(valid_pixels.size),
-                "datos_f32_b64": datos_b64,
-            }
-        finally:
-            hdul.close()
+                alto_out, ancho_out = recorte.shape
+                datos_bytes = np.ascontiguousarray(recorte, dtype="<f4").tobytes()
+                datos_b64 = base64.b64encode(datos_bytes).decode("ascii")
+
+                detector_val = header.get("DETECTOR")
+                if isinstance(detector_val, (int, np.integer)):
+                    detector: int | str = int(detector_val)
+                elif isinstance(detector_val, str) and detector_val.isdigit():
+                    detector = int(detector_val)
+                else:
+                    detector = str(detector_val or "")
+
+                resultado = {
+                    "identificador": str(header.get("OBSID", header.get("OBS_ID", "SPHEREx"))),
+                    "detector": detector,
+                    "unidad": str(header.get("BUNIT", "MJy/sr")),
+                    "ancho": int(ancho_out),
+                    "alto": int(alto_out),
+                    "vmin": float(vmin),
+                    "vmax": float(vmax),
+                    "mediana": mediana,
+                    "ruido_mad": ruido_mad,
+                    "ra_centro": float(ra_resultado),
+                    "dec_centro": float(dec_resultado),
+                    "fov_arcsec": float(fov_resultado),
+                    "pixscale_arcsec": float(fov_resultado / max(ancho_out, alto_out)),
+                    "cobertura_wcs": bool(cobertura_wcs),
+                    "pixeles_validos": int(valid_pixels.size),
+                    "datos_f32_b64": datos_b64,
+                }
+            finally:
+                hdul.close()
+                if data is not None:
+                    del data
+                gc.collect()
 
         with self._lock:
             self._cache_recortes[clave_cache] = dict(resultado)

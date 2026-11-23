@@ -65,6 +65,29 @@ const OFFSCREEN_HEIGHT = 280;
 const cutoutMemoryCache = new Map<string, DecodedFitsCutout>();
 const cutoutInFlight = new Map<string, Promise<DecodedFitsCutout>>();
 
+const MAX_GLOBAL_CUTOUT_FETCHES = 2;
+let activeCutoutFetches = 0;
+const cutoutWaitQueue: Array<() => void> = [];
+
+function acquireCutoutSlot(): Promise<void> {
+  if (activeCutoutFetches < MAX_GLOBAL_CUTOUT_FETCHES) {
+    activeCutoutFetches += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    cutoutWaitQueue.push(() => {
+      activeCutoutFetches += 1;
+      resolve();
+    });
+  });
+}
+
+function releaseCutoutSlot() {
+  activeCutoutFetches = Math.max(0, activeCutoutFetches - 1);
+  const next = cutoutWaitQueue.shift();
+  if (next) next();
+}
+
 function decodeFloat32Base64(b64: string): Float32Array {
   const binary = atob(b64);
   const len = binary.length;
@@ -136,34 +159,75 @@ async function fetchDecodedFitsCutout(
       fovArcsec: fetchFovArcsec,
       tamanoPx: 280,
     });
-    const res = await fetch(url, { cache: "no-store" });
-    const raw = (await res.json()) as FitsCutoutPayload & { detail?: string };
-    if (!res.ok) {
-      throw new Error(
-        raw?.detail || `Error HTTP ${res.status} al leer FITS real.`
-      );
+    const retryDelaysMs = [1500, 3500];
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= retryDelaysMs.length; attempt++) {
+      let slotAcquired = false;
+      await acquireCutoutSlot();
+      slotAcquired = true;
+
+      try {
+        let res: Response;
+        try {
+          res = await fetch(url, { cache: "no-store" });
+        } catch (err) {
+          lastError =
+            err instanceof Error
+              ? err
+              : new Error("Error de red al descargar recorte FITS.");
+          if (attempt < retryDelaysMs.length) {
+            releaseCutoutSlot();
+            slotAcquired = false;
+            await new Promise((r) => setTimeout(r, retryDelaysMs[attempt]));
+            continue;
+          }
+          throw lastError;
+        }
+
+        const raw = (await res.json()) as FitsCutoutPayload & { detail?: string };
+        if (!res.ok) {
+          const retryable = res.status === 429 || res.status >= 500;
+          lastError = new Error(
+            raw?.detail || `Error HTTP ${res.status} al leer FITS real.`
+          );
+          if (retryable && attempt < retryDelaysMs.length) {
+            releaseCutoutSlot();
+            slotAcquired = false;
+            await new Promise((r) => setTimeout(r, retryDelaysMs[attempt]));
+            continue;
+          }
+          throw lastError;
+        }
+
+        const decoded: DecodedFitsCutout = {
+          identificador: raw.identificador,
+          detector: raw.detector,
+          unidad: raw.unidad || "MJy/sr",
+          ancho: raw.ancho,
+          alto: raw.alto,
+          vmin: raw.vmin,
+          vmax: raw.vmax,
+          mediana: raw.mediana,
+          ruidoMad: raw.ruido_mad,
+          raCentro: raw.ra_centro,
+          decCentro: raw.dec_centro,
+          fovArcsec: raw.fov_arcsec,
+          pixscaleArcsec: raw.pixscale_arcsec,
+          coberturaWcs: raw.cobertura_wcs,
+          pixelesValidos: raw.pixeles_validos,
+          flux: decodeFloat32Base64(raw.datos_f32_b64),
+        };
+        setBoundedCacheEntry(key, decoded);
+        return decoded;
+      } finally {
+        if (slotAcquired) {
+          releaseCutoutSlot();
+        }
+      }
     }
 
-    const decoded: DecodedFitsCutout = {
-      identificador: raw.identificador,
-      detector: raw.detector,
-      unidad: raw.unidad || "MJy/sr",
-      ancho: raw.ancho,
-      alto: raw.alto,
-      vmin: raw.vmin,
-      vmax: raw.vmax,
-      mediana: raw.mediana,
-      ruidoMad: raw.ruido_mad,
-      raCentro: raw.ra_centro,
-      decCentro: raw.dec_centro,
-      fovArcsec: raw.fov_arcsec,
-      pixscaleArcsec: raw.pixscale_arcsec,
-      coberturaWcs: raw.cobertura_wcs,
-      pixelesValidos: raw.pixeles_validos,
-      flux: decodeFloat32Base64(raw.datos_f32_b64),
-    };
-    setBoundedCacheEntry(key, decoded);
-    return decoded;
+    throw lastError ?? new Error("No se pudo cargar el recorte FITS.");
   })();
 
   cutoutInFlight.set(key, promise);
@@ -574,11 +638,11 @@ export default function SkyVideoCanvas({
       queue.push({ fitsUrl, key });
     };
 
-    enqueue(activeFrame);
+    const refTarget = frames[referenceFrameIndex] ?? frames[0];
     if (playbackMode === "difference" || playbackMode === "sum") {
-      enqueue(refFrame);
+      enqueue(refTarget);
     }
-    const maxPrefetch = stackByDetector ? frames.length : Math.min(frames.length, 8);
+    const maxPrefetch = stackByDetector ? frames.length : Math.min(frames.length, 10);
     for (let i = 0; i < maxPrefetch; i++) {
       enqueue(frames[i]);
     }
@@ -627,8 +691,7 @@ export default function SkyVideoCanvas({
     };
   }, [
     frames,
-    activeFrame,
-    refFrame,
+    referenceFrameIndex,
     centerRaDeg,
     centerDecDeg,
     fetchFovArcsec,
@@ -636,6 +699,38 @@ export default function SkyVideoCanvas({
     stackByDetector,
     reloadNonce,
   ]);
+
+  useEffect(() => {
+    if (!activeFrame || !activeKey) return;
+    if (cutoutMemoryCache.has(activeKey) || cutoutInFlight.has(activeKey)) return;
+    if (frameErrors[activeKey]) return;
+
+    let cancelled = false;
+    void fetchDecodedFitsCutout(
+      activeFrame.observacion.url_acceso,
+      centerRaDeg,
+      centerDecDeg,
+      fetchFovArcsec
+    )
+      .then(() => {
+        if (!cancelled) {
+          setCacheTick((t) => t + 1);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          const msg =
+            err instanceof Error
+              ? err.message
+              : "Error al cargar el recorte FITS.";
+          setFrameErrors((prev) => ({ ...prev, [activeKey]: msg }));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFrame, activeKey, centerRaDeg, centerDecDeg, fetchFovArcsec, frameErrors]);
 
   const activeCutout = useMemo(() => {
     void cacheTick;

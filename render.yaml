@@ -15,11 +15,13 @@ services:
       - key: SPHEREX_CACHE_FITS
         value: "1"
       - key: SPHEREX_CACHE_FITS_BYTES
-        value: "134217728"
+        value: "25165824"
       - key: SPHEREX_CACHE_PNG
         value: "4"
       - key: SPHEREX_CACHE_RECORTES
-        value: "16"
+        value: "24"
+      - key: SPHEREX_CONCURRENCIA_RECORTES
+        value: "2"
       - key: SPHEREX_TIMEOUT_DESCARGA
         value: "60"
       - key: SPHEREX_LOG_LEVEL
